@@ -1,0 +1,23 @@
+# FL coordinator OPERATOR roster (NOT participating organisations).
+#
+# These are the humans/automation that administer the federation: start rounds,
+# enroll/revoke orgs, run aggregation, read the audit trail. This is a SEPARATE
+# trust domain from any participating org and from any org platform's own users.
+#
+# Roles:  fl_viewer  (read-only) | fl_operator (rounds + aggregate + block) |
+#         fl_admin   (enroll/revoke orgs, manage users, configure rounds)
+#
+# api_key_hash is sha256(api_key). Generate a key + hash:
+#   python - <<'PY'
+#   import secrets, hashlib
+#   k = secrets.token_urlsafe(32)
+#   print("api_key  :", k)
+#   print("api_key_hash:", hashlib.sha256(k.encode()).hexdigest())
+#   PY
+# Store the api_key in your operator's secret manager; only the hash goes here.
+# Copy this file to config/fl_users.yml and replace the placeholder hash.
+
+users:
+  - username: root
+    role: fl_admin
+    api_key_hash: "REPLACE_WITH_sha256_OF_YOUR_OPERATOR_API_KEY"

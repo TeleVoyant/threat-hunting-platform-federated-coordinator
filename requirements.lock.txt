@@ -1,0 +1,14 @@
+# Pinned versions verified against the reference test environment (Python 3.13).
+# Regenerate with: pip-compile requirements.txt  (or pip freeze of a clean venv).
+fastapi==0.136.1
+starlette==1.0.0
+uvicorn==0.46.0
+python-multipart==0.0.27
+cryptography==46.0.7
+pyjwt==2.12.1
+pydantic==2.13.3
+pyyaml==6.0.3
+xgboost==3.2.0
+numpy==2.4.4
+# reference client only:
+requests==2.33.1

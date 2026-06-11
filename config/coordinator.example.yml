@@ -1,0 +1,26 @@
+# Reference of the coordinator's tunables (currently sourced from ENV VARS,
+# see coordinator/app.py). This file documents the knobs in one place; copy
+# the values you need into your compose `environment:` / .env.
+#
+# Paths --------------------------------------------------------------------
+# FL_DATA_DIR          base dir for DB + audit + models   (default data/fl_coordinator)
+# FL_CA_DIR            federation CA material             (default $FL_DATA_DIR/ca)
+# FL_MODEL_DIR         contributions + aggregated models  (default $FL_DATA_DIR/models)
+# FL_USERS_FILE        operator roster                    (config/fl_users.yml)
+# FL_VALIDATION_DATA   public/synthetic libsvm validation set for trust scoring
+#                      (unset => structure-only trust, no accuracy gate)
+#
+# Secrets (read from *_FILE, i.e. Docker secrets — never plain env) ----------
+# FL_JWT_SECRET_FILE   operator JWT signing secret (>=32 bytes)
+#
+# Limits / guards -----------------------------------------------------------
+# FL_MAX_MODEL_BYTES   reject contributions larger than this (default 67108864 = 64 MiB)
+#
+# Trust thresholds (currently set in coordinator/trust.py:TrustManager) -----
+#   min_accuracy        0.5    reject contributions scoring below this on validation
+#   max_accuracy_drop   0.15   sudden drop vs the org's last round => poisoning reject
+#   min_trust           0.3    orgs below this are blocked from contributing (SR-05)
+#
+# Dev only ------------------------------------------------------------------
+# FL_DEV_ALLOW_HEADER_MTLS=1   accept X-Dev-Mtls-Org-Id header instead of real mTLS.
+#                              NEVER set in production — it lets any caller spoof org id.

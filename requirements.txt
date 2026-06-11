@@ -1,0 +1,15 @@
+# apt-fl-coordinator runtime dependencies (server).
+# The vendored flproto/ crypto core needs only cryptography; the rest power
+# the FastAPI app, JWT auth, trust-validation (xgboost), and config loading.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9     # multipart contribution uploads (Form + UploadFile)
+cryptography>=42.0          # Ed25519 attestations + federation CA / mTLS
+pyjwt>=2.8                  # FL operator JWTs
+pydantic>=2.6
+pyyaml>=6.0                 # user roster + config
+xgboost>=2.0                # trust validation (load + score contributions)
+numpy>=1.24                 # validation-set arrays + DP noise
+
+# Reference client only (client_ref/) — not needed to run the coordinator:
+requests>=2.31              # mTLS HTTP calls from a participating org

@@ -1,0 +1,74 @@
+# apt-fl-coordinator — standalone federated aggregation server.
+#
+# One-time bootstrap before first `up` (writes CA + coordinator TLS material
+# into the named volume's ca/ dir):
+#
+#   docker compose run --rm coordinator \
+#       python -m coordinator.init_ca --ca-dir /app/data/ca --hostname fl.example.com
+#
+# Then put your operator JWT secret in ./secrets/fl_jwt_secret (>=32 bytes) and
+# an FL operator roster in ./config/fl_users.yml, and:  docker compose up -d
+#
+# Security posture (SR-02 / SR-06): read-only rootfs, non-root, all caps dropped,
+# no-new-privileges, isolated network, mTLS-required TLS, secrets via files
+# (never env). The coordinator is a SEPARATE trust boundary from any org platform.
+
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: apt-fl-coordinator:latest
+    hostname: fl-coordinator
+    user: "1000:1000"
+    read_only: true
+    ports:
+      - "8889:8889"          # REST + mTLS matrix-exchange API
+    command: >
+      python -m uvicorn coordinator.app:app
+      --host 0.0.0.0 --port 8889
+      --ssl-certfile /app/data/ca/coordinator_cert.pem
+      --ssl-keyfile  /app/data/ca/coordinator_key.pem
+      --ssl-ca-certs /app/data/ca/ca_cert.pem
+      --ssl-cert-reqs 2
+    environment:
+      - FL_DATA_DIR=/app/data
+      - FL_CA_DIR=/app/data/ca
+      - FL_MODEL_DIR=/app/data/models
+      - FL_USERS_FILE=/app/config/fl_users.yml
+      # Operator JWT secret is read from this Docker-secret FILE, never env (SR-02).
+      - FL_JWT_SECRET_FILE=/run/secrets/fl_jwt_secret
+      # Public/synthetic validation set for trust + poisoning scoring (optional;
+      # unset => structure-only trust). Mount it read-only under /app/config.
+      - FL_VALIDATION_DATA=/app/config/validation.svm
+      - FL_MAX_MODEL_BYTES=67108864
+    volumes:
+      - fl-coordinator-data:/app/data           # CA + DB + audit + models (writable)
+      - ./config:/app/config:ro                 # roster + validation set (read-only)
+    secrets:
+      - fl_jwt_secret
+    tmpfs:
+      - /tmp:size=32M,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+    networks:
+      - fl-net
+    restart: unless-stopped
+
+secrets:
+  fl_jwt_secret:
+    file: ./secrets/fl_jwt_secret              # >=32 random bytes; NOT committed
+
+volumes:
+  fl-coordinator-data:
+
+networks:
+  fl-net:
+    driver: bridge

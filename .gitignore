@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+secrets/*
+!secrets/.gitkeep
+
+# Live operator roster + validation data (only the .example.* are committed)
+config/fl_users.yml
+config/validation.svm
+
+# Runtime state
+data/
+*.db
+*.db-wal
+*.db-shm
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
