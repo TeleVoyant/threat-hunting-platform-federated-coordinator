@@ -16,6 +16,12 @@ COPY coordinator/  coordinator/
 COPY client_ref/   client_ref/
 COPY config/       config/
 
+# Pre-create the runtime data dir owned by flcoord. A fresh named volume mounted
+# at /app/data inherits this ownership, so the non-root user can write the CA /
+# DB / models. Without this, init_ca fails with PermissionError on /app/data/ca
+# (a fresh named volume is root-owned, and the service drops CAP_CHOWN).
+RUN mkdir -p /app/data && chown -R flcoord:flcoord /app/data
+
 USER flcoord
 
 EXPOSE 8889
