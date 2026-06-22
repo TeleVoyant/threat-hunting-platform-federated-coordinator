@@ -62,6 +62,9 @@ for the threat model and disclosure policy.
 ```bash
 # 1. Operator JWT secret (Docker secret — never committed / never in env)
 openssl rand -base64 48 > secrets/fl_jwt_secret
+# The container runs as uid 1000; compose bind-mounts this file as-is, so it
+# must be readable by uid 1000 (a fresh root-owned 600 file is not).
+chown 1000:1000 secrets/fl_jwt_secret
 
 # 2. Operator roster — generate an api_key + hash, put the hash in config/fl_users.yml
 cp config/fl_users.example.yml config/fl_users.yml   # then edit api_key_hash
