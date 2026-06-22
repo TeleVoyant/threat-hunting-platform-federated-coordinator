@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Round {{ round_id }} · FL Coordinator{% endblock %}
+{% block heading %}Round {{ round_id }}{% endblock %}
+{% block content %}
+<div x-data="roundPage({{ round_id }})" x-init="load()">
+  <div class="row" style="margin-bottom:14px">
+    <a class="btn btn-sm" href="/dashboard/rounds"><i data-lucide="arrow-left"></i> All rounds</a>
+    <span x-show="r" class="pill" :class="'p-'+(r&&r.status)" x-text="r&&r.status"></span>
+    <button class="btn btn-sm" @click="load()"><i data-lucide="refresh-cw"></i></button>
+  </div>
+
+  <template x-if="r">
+   <div>
+    <div class="grid" style="grid-template-columns:1fr 1fr">
+      <div class="card">
+        <h2>Parameters</h2>
+        <table>
+          <tr><td class="muted">DP epsilon</td><td x-text="r.params.epsilon"></td></tr>
+          <tr><td class="muted">Local boost rounds</td><td x-text="r.params.num_boost_rounds"></td></tr>
+          <tr><td class="muted">Min clients</td><td x-text="r.params.min_clients"></td></tr>
+          <tr><td class="muted">Observation window</td><td x-text="(r.params.observation_hours??0)+' h'"></td></tr>
+          <tr><td class="muted">Started</td><td x-text="dt(r.started_at)"></td></tr>
+          <tr><td class="muted">Invited / accepted</td>
+            <td><span x-text="r.num_clients_invited"></span> / <span x-text="r.num_clients_accepted"></span></td></tr>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Lifecycle</h2>
+        <p class="muted" style="font-size:13px" x-text="lifecycleNote()"></p>
+        {% if perms.fl_aggregate_round %}
+        <div class="row">
+          <button class="btn btn-primary" x-show="r.status==='running'" :disabled="busy" @click="aggregate()">
+            <i data-lucide="git-merge"></i> Aggregate (stage)</button>
+          <button class="btn btn-primary" x-show="r.status==='aggregated'" :disabled="busy" @click="publish()">
+            <i data-lucide="upload-cloud"></i> Publish global model</button>
+          <span x-show="r.status==='completed'" class="muted">Published ·
+            <a class="mono" href="/dashboard/models">view versions</a></span>
+        </div>
+        {% else %}<p class="muted">Your role can view this round but not aggregate/publish.</p>{% endif %}
+      </div>
+    </div>
+
+    <template x-if="r.eval_metrics">
+     <div class="card" style="margin-top:14px">
+      <h2>Aggregation result</h2>
+      <div class="row" style="margin-bottom:8px">
+        <span class="muted">merged trees:</span>
+        <span class="mono" x-text="r.eval_metrics.merge ? r.eval_metrics.merge.total_trees : '—'"></span>
+        <span class="muted">· models combined:</span>
+        <span class="mono" x-text="r.eval_metrics.merge ? r.eval_metrics.merge.num_models : '—'"></span>
+      </div>
+      <table>
+        <thead><tr><th>Org</th><th>Included</th><th>Accuracy</th><th>Trust</th><th>Reason</th></tr></thead>
+        <tbody>
+          <template x-for="c in (r.eval_metrics.contributors||[])" :key="c.org_id">
+            <tr><td class="mono" x-text="c.org_id"></td>
+              <td><span class="pill" :class="c.accepted?'p-active':'p-blocked'" x-text="c.accepted?'yes':'no'"></span></td>
+              <td class="tabnum" x-text="c.accuracy!=null? (c.accuracy*100).toFixed(1)+'%':'—'"></td>
+              <td class="tabnum" x-text="c.trust!=null? c.trust.toFixed(2):'—'"></td>
+              <td class="muted" x-text="c.reason"></td></tr>
+          </template>
+        </tbody>
+      </table>
+     </div>
+    </template>
+
+    <div class="card" style="margin-top:14px" x-show="r.round_announcement">
+      <h2>Signed round announcement</h2>
+      <pre class="json" x-text="r.round_announcement ? r.round_announcement.signed_attestation : ''"></pre>
+    </div>
+   </div>
+  </template>
+  <div x-show="!r&&loaded" class="empty">Round not found.</div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function roundPage(rid){
+  return {
+    rid, r:null, loaded:false, busy:false,
+    async load(){ try{ this.r=await apiGet('/fl/rounds/'+this.rid); }catch(e){ this.r=null; }
+      this.loaded=true; this.$nextTick(()=>window.lucide&&lucide.createIcons()); },
+    lifecycleNote(){
+      if(!this.r) return '';
+      const s=this.r.status;
+      if(s==='running')   return 'Collecting contributions. Aggregate is allowed once the intake/observation window elapses.';
+      if(s==='aggregated')return 'A global model is STAGED and soaking under observation. Publish it after the soak window to serve it to orgs.';
+      if(s==='completed') return 'The global model from this round has been published (active or archived).';
+      return '';
+    },
+    async aggregate(){ this.busy=true;
+      try{ const a=await apiPost('/fl/rounds/'+this.rid+'/aggregate');
+        toast('Staged v'+a.version_id+' ('+a.merge.total_trees+' trees)','ok'); }
+      catch(e){ toast('Aggregate: '+e.message,'error'); } finally{ this.busy=false; await this.load(); } },
+    async publish(){ this.busy=true;
+      try{ const p=await apiPost('/fl/rounds/'+this.rid+'/publish'); toast('Published v'+p.version_id+' (active)','ok'); }
+      catch(e){ toast('Publish: '+e.message,'error'); } finally{ this.busy=false; await this.load(); } },
+  }
+}
+</script>
+{% endblock %}

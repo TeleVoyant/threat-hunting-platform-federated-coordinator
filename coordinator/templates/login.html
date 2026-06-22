@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · FL Coordinator</title>
+  <style>
+    :root{--bg-0:#0b0f17;--bg-1:#131925;--fg-0:#e6edf6;--fg-1:#aab6c8;--fg-2:#7d8aa0;
+      --border:#243049;--border-2:#2f3b54;--accent:#4f8cff;--danger:#f0556a;
+      --sans:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg-0);color:var(--fg-0);
+      font-family:var(--sans);display:flex;min-height:100vh;align-items:center;justify-content:center}
+    .box{width:360px;background:var(--bg-1);border:1px solid var(--border);border-radius:14px;padding:30px}
+    .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;margin-bottom:4px}
+    .dot{width:11px;height:11px;border-radius:50%;background:var(--accent);box-shadow:0 0 14px var(--accent)}
+    .sub{color:var(--fg-2);font-size:13px;margin-bottom:22px}
+    label{display:block;font-size:12px;color:var(--fg-1);margin:0 0 6px;font-weight:600}
+    .field{margin-bottom:14px}
+    input{width:100%;padding:10px 12px;background:var(--bg-0);border:1px solid var(--border-2);
+      border-radius:8px;color:var(--fg-0);font:inherit}
+    button{width:100%;padding:11px;background:var(--accent);border:0;border-radius:8px;color:#fff;
+      font:inherit;font-weight:700;cursor:pointer;margin-top:6px}
+    button:hover{filter:brightness(1.08)}
+    .err{background:rgba(240,85,106,.14);color:var(--danger);border-radius:8px;padding:9px 12px;
+      font-size:13px;margin-bottom:16px}
+    .hint{color:var(--fg-2);font-size:11px;margin-top:16px;text-align:center}
+  </style>
+</head>
+<body>
+  <form class="box" method="post" action="/login">
+    <div class="brand"><span class="dot"></span> FL Coordinator</div>
+    <div class="sub">Federation operator console</div>
+    {% if error %}<div class="err">{{ error }}</div>{% endif %}
+    <div class="field">
+      <label>Operator username</label>
+      <input name="username" autocomplete="username" autofocus required>
+    </div>
+    <div class="field">
+      <label>API key</label>
+      <input name="api_key" type="password" autocomplete="current-password" required>
+    </div>
+    <button type="submit">Sign in</button>
+    <div class="hint">Separate trust boundary — these are FL operator credentials,
+      not any org platform's.</div>
+  </form>
+</body>
+</html>

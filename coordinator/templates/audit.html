@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Audit trail · FL Coordinator{% endblock %}
+{% block heading %}Audit trail{% endblock %}
+{% block content %}
+<div x-data="auditPage()" x-init="load()">
+  <div class="card" style="margin-bottom:14px">
+    <div class="between">
+      <div class="row"><i data-lucide="link" style="width:16px;color:var(--success)"></i>
+        <span class="muted" style="font-size:13px">Every entry is SHA-256 hash-chained to the previous one — tampering breaks the chain. Newest first.</span></div>
+      <div class="row">
+        <select class="input" style="width:auto" x-model.number="limit" @change="load()">
+          <option :value="50">50</option><option :value="100">100</option><option :value="250">250</option></select>
+        <button class="btn btn-sm" @click="load()"><i data-lucide="refresh-cw"></i></button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>#</th><th>Action</th><th>Actor</th><th>Target</th><th>When</th><th>Chain hash</th></tr></thead>
+      <tbody>
+        <template x-for="a in entries" :key="a.id">
+          <tr style="cursor:pointer" @click="open=(open===a.id?null:a.id)">
+            <td class="mono muted" x-text="a.id"></td>
+            <td class="mono" x-text="a.action"></td>
+            <td x-text="a.actor"></td>
+            <td class="mono muted" x-text="a.target||'—'"></td>
+            <td class="muted" x-text="dt(a.timestamp)"></td>
+            <td class="mono muted" x-text="a.chain_hash? a.chain_hash.slice(0,16)+'…':''"></td>
+          </tr>
+          <template x-if="open===a.id">
+            <tr><td colspan="6" style="background:var(--bg-0)">
+              <pre class="json" x-text="JSON.stringify(a.details,null,2)"></pre></td></tr>
+          </template>
+        </template>
+        <tr x-show="entries.length===0"><td colspan="6" class="empty">No audit entries.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function auditPage(){
+  return {
+    entries:[], limit:50, open:null,
+    async load(){ try{ this.entries=(await apiGet('/fl/audit?limit='+this.limit)).entries||[] }
+      catch(e){toast(e.message,'error')} this.$nextTick(()=>window.lucide&&lucide.createIcons()); },
+  }
+}
+</script>
+{% endblock %}

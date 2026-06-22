@@ -31,7 +31,9 @@ import hashlib
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter, Cookie, Depends, File, Form, Header, HTTPException, Request, UploadFile,
+)
 from fastapi.security import APIKeyHeader, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -43,8 +45,13 @@ from flproto.attestation import (
 from flproto.ca import (
     cert_to_pem, issue_client_cert,
 )
-from coordinator.aggregation import merge_xgboost_models
+from coordinator.aggregation import (
+    describe_schema, merge_xgboost_models, model_feature_schema,
+)
 from coordinator.security import FLAuthManager, FLUser, generate_fl_api_key
+from coordinator.logging import get_logger
+
+logger = get_logger("coordinator.api")
 
 router = APIRouter(prefix="/fl", tags=["fl-coordinator"])
 
@@ -52,6 +59,27 @@ router = APIRouter(prefix="/fl", tags=["fl-coordinator"])
 # Override via FL_MAX_MODEL_BYTES. 64 MiB comfortably fits a 500-tree ensemble.
 import os as _os
 _MAX_MODEL_BYTES = int(_os.environ.get("FL_MAX_MODEL_BYTES", 64 * 1024 * 1024))
+
+
+def _require_mtls() -> bool:
+    """When FL_REQUIRE_MTLS is truthy the X-FL-API-Key org fallback is refused
+    and org endpoints accept verified-mTLS identity ONLY. Set it in production
+    (behind uvicorn --ssl-cert-reqs 2) so a misconfigured transport cannot
+    silently downgrade to bootstrap-key auth. Read per-request so it can be
+    toggled without rebuilding the app."""
+    return _os.environ.get("FL_REQUIRE_MTLS", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _default_observation_hours() -> float:
+    """Default soak window (hours) for both the round intake window and the
+    staged-global-model observation window. Set FL_OBSERVATION_HOURS=0 to make
+    both immediate (useful for demos/tests)."""
+    try:
+        return float(_os.environ.get("FL_OBSERVATION_HOURS", "48"))
+    except ValueError:
+        return 48.0
 
 _bearer  = HTTPBearer(auto_error=False)
 _api_key = APIKeyHeader(name="X-FL-API-Key", auto_error=False)
@@ -63,10 +91,18 @@ async def get_fl_user(
     request: Request,
     bearer  = Depends(_bearer),
     api_key = Depends(_api_key),
+    fl_session: Optional[str] = Cookie(default=None),
 ) -> FLUser:
+    """Operator identity from (in order) a Bearer JWT, the dashboard's
+    `fl_session` cookie JWT, or the X-FL-API-Key header. The cookie path lets
+    the browser dashboard reuse these exact endpoints (same RBAC + audit)."""
     auth_manager: FLAuthManager = request.app.state.fl_auth_manager
     if bearer and bearer.credentials:
         user = auth_manager.verify_jwt(bearer.credentials)
+        if user:
+            return user
+    if fl_session:
+        user = auth_manager.verify_jwt(fl_session)
         if user:
             return user
     if api_key:
@@ -131,14 +167,22 @@ async def get_authenticated_org_id(
     if org_id:
         return org_id
 
-    # Fallback to API-key bootstrap auth
+    # Production hardening: refuse the bootstrap api-key fallback when mTLS is
+    # required, so org endpoints can only be reached with a verified client cert.
+    if _require_mtls():
+        raise HTTPException(
+            401,
+            "mTLS client certificate required (FL_REQUIRE_MTLS enabled); "
+            "the X-FL-API-Key bootstrap fallback is disabled",
+        )
+
+    # Fallback to API-key bootstrap auth (constant-time compare; hash once).
     if api_key:
-        store = _store(request)
-        for org in store.list_orgs():
+        import hmac as _hmac
+        api_hash = hashlib.sha256(api_key.encode()).hexdigest()
+        for org in _store(request).list_orgs():
             if org["status"] != "active":
                 continue
-            api_hash = hashlib.sha256(api_key.encode()).hexdigest()
-            import hmac as _hmac
             if _hmac.compare_digest(org["api_key_hash"], api_hash):
                 return org["org_id"]
 
@@ -170,6 +214,11 @@ class StartRoundRequest(BaseModel):
     target_org_ids:    Optional[list[str]] = Field(
         None,
         description="If null, invite all active orgs. Otherwise restrict to this list.",
+    )
+    observation_hours: Optional[float] = Field(
+        None, ge=0.0, le=720.0,
+        description="Intake + staged-model observation window (hours). Defaults "
+                    "to FL_OBSERVATION_HOURS (48). 0 = no wait (demo/test).",
     )
 
 
@@ -332,9 +381,12 @@ async def start_round(
     user: FLUser = Depends(fl_require("fl_start_round")),
 ):
     """
-    Create a new FL round record. The actual gRPC orchestration is done
-    by the Flower server alongside this API; this endpoint records the
-    intent + parameters + invited orgs for audit.
+    Open a new FL round: validate the invited set, record the round, and —
+    when the federation CA is initialised — emit a coordinator-SIGNED round
+    announcement so invited orgs can cryptographically verify the round is
+    authentic before training/contributing (fetched via
+    GET /rounds/{id}/announcement). Aggregation happens later over REST via
+    POST /rounds/{id}/aggregate; there is no Flower/gRPC server involved.
     """
     store = _store(request)
     active_orgs = [o for o in store.list_orgs() if o["status"] == "active"]
@@ -347,12 +399,38 @@ async def start_round(
             422,
             f"Only {len(invited)} active orgs but min_clients={body.min_clients}",
         )
+    invited_ids = [o["org_id"] for o in invited]
+
+    obs_hours = (body.observation_hours if body.observation_hours is not None
+                 else _default_observation_hours())
+    params = body.model_dump()
+    params["observation_hours"] = obs_hours
 
     round_id = store.start_round(
         started_by=user.username,
-        params=body.model_dump(),
+        params=params,
         invited_count=len(invited),
     )
+    intake_until = store.get_round(round_id)["started_at"] + obs_hours * 3600
+
+    # Coordinator-signed round announcement (no rogue round invites). Requires
+    # the coordinator keypair; skipped gracefully when the CA is not loaded.
+    announcement = None
+    coord_priv = getattr(request.app.state, "fl_coord_priv", None)
+    if coord_priv is not None:
+        ann_bytes = build_round_announcement_attestation(
+            round_id=round_id,
+            epsilon=body.epsilon,
+            num_boost_rounds=body.num_boost_rounds,
+            invited_org_ids=invited_ids,
+        )
+        sig_hex = att_sign(coord_priv, ann_bytes).hex()
+        store.set_round_announcement(round_id, ann_bytes, sig_hex)
+        announcement = {
+            "signed_attestation": ann_bytes.decode("utf-8"),
+            "signature_hex": sig_hex,
+        }
+
     _audit(request).log(
         action="fl.round.start",
         actor=user.username,
@@ -360,14 +438,18 @@ async def start_round(
         details={
             "epsilon":         body.epsilon,
             "num_boost_rounds": body.num_boost_rounds,
-            "invited_orgs":    [o["org_id"] for o in invited],
+            "invited_orgs":    invited_ids,
+            "announced":       announcement is not None,
         },
     )
     return {
-        "round_id":      round_id,
-        "status":        "running",
-        "invited_orgs":  [o["org_id"] for o in invited],
-        "params":        body.model_dump(),
+        "round_id":           round_id,
+        "status":             "running",
+        "invited_orgs":       invited_ids,
+        "params":             params,
+        "observation_hours":  obs_hours,
+        "intake_until":       intake_until,
+        "round_announcement": announcement,
     }
 
 
@@ -378,6 +460,37 @@ async def list_rounds(
     user: FLUser = Depends(fl_require("fl_view_rounds")),
 ):
     return {"rounds": _store(request).list_rounds(limit=limit)}
+
+
+# Declared BEFORE /rounds/{round_id} so the literal path wins over the int param.
+@router.get("/rounds/active")
+async def list_active_rounds_for_org(
+    request: Request,
+    org_id: str = Depends(get_authenticated_org_id),
+):
+    """Org-facing round discovery: open rounds (status 'running') this org is
+    invited to, so a participant client can find and join rounds without
+    out-of-band coordination. Each entry says whether the intake window is still
+    open (contributions accepted) or has closed (awaiting aggregation)."""
+    store = _store(request)
+    now = time.time()
+    out = []
+    for r in store.list_rounds_by_status("running"):
+        params = r.get("params") or {}
+        targets = params.get("target_org_ids")
+        if targets and org_id not in targets:
+            continue
+        obs_hours = float(params.get("observation_hours", 0) or 0)
+        intake_until = r["started_at"] + obs_hours * 3600
+        out.append({
+            "round_id":         r["round_id"],
+            "started_at":       r["started_at"],
+            "intake_until":     intake_until,
+            "intake_open":      now < intake_until,
+            "epsilon":          params.get("epsilon"),
+            "num_boost_rounds": params.get("num_boost_rounds"),
+        })
+    return {"org_id": org_id, "active_rounds": out}
 
 
 @router.get("/rounds/{round_id}")
@@ -417,6 +530,28 @@ async def issue_round_challenge(
     challenge = generate_challenge()
     info = store.issue_challenge(org_id, round_id, challenge, ttl_seconds=600)
     return {"challenge": info["challenge"], "expires_at": info["expires_at"]}
+
+
+@router.get("/rounds/{round_id}/announcement")
+async def get_round_announcement(
+    round_id: int,
+    request: Request,
+    org_id: str = Depends(get_authenticated_org_id),
+):
+    """
+    Coordinator-signed announcement for this round. An invited org verifies the
+    Ed25519 signature with the coordinator public key it received at enrollment,
+    confirming the round (id, epsilon, boost rounds, invited set) was authorised
+    by the coordinator before it trains or contributes — defends against rogue
+    round invites from a coordinator-impersonator.
+    """
+    r = _store(request).get_round(round_id)
+    if not r:
+        raise HTTPException(404, f"Round not found: {round_id}")
+    ann = r.get("round_announcement")
+    if not ann:
+        raise HTTPException(404, f"Round {round_id} has no signed announcement")
+    return {"round_id": round_id, **ann}
 
 
 @router.post("/rounds/{round_id}/contribute", status_code=202)
@@ -564,53 +699,70 @@ async def submit_contribution(
     }
 
 
-@router.get("/rounds/{round_id}/global-model")
-async def get_global_model(
-    round_id: int,
-    request: Request,
-    org_id: str = Depends(get_authenticated_org_id),
-):
-    """
-    Return the aggregated global model for this round, with a coordinator
-    signature so the org can verify it wasn't tampered or forged.
-
-    The signed_attestation field contains the EXACT bytes the coordinator
-    signed (org should NOT re-canonicalise — verify against these bytes).
-    """
+def _signed_model_response(request: Request, round_id: int, model_bytes: bytes) -> dict:
+    """Coordinator-sign `model_bytes` for `round_id` and shape the org response.
+    signed_attestation is the EXACT bytes the coordinator signed — the org
+    verifies against these (do NOT re-canonicalise)."""
+    import base64
     store = _store(request)
-    r = store.get_round(round_id)
-    if not r:
-        raise HTTPException(404, f"Round not found: {round_id}")
-    if r["status"] != "completed":
-        raise HTTPException(409, f"Round {round_id} not completed yet")
-
-    # Pull the model from disk (coordinator stores aggregated models per round)
-    from pathlib import Path
-    model_dir = Path(request.app.state.fl_model_dir)
-    model_path = model_dir / f"round_{round_id}.json"
-    if not model_path.exists():
-        raise HTTPException(404, f"Aggregated model file missing for round {round_id}")
-    model_bytes = model_path.read_bytes()
-
-    # Build + sign the attestation with the coordinator's private key
     accepted_orgs = [
-        c["org_id"] for c in store.list_contributions(round_id=round_id)
-        if c["accepted"]
+        c["org_id"] for c in store.list_contributions(round_id=round_id) if c["accepted"]
     ]
     att_bytes = build_global_model_attestation(
-        round_id=round_id,
-        model_bytes=model_bytes,
+        round_id=round_id, model_bytes=model_bytes,
         accepted_org_ids=sorted(set(accepted_orgs)),
     )
     sig = att_sign(request.app.state.fl_coord_priv, att_bytes)
-
-    import base64
     return {
         "round_id":           round_id,
         "model_b64":          base64.b64encode(model_bytes).decode(),
         "signed_attestation": att_bytes.decode("utf-8"),
         "signature_hex":      sig.hex(),
     }
+
+
+@router.get("/global-model")
+async def get_active_global_model(
+    request: Request,
+    org_id: str = Depends(get_authenticated_org_id),
+):
+    """The CURRENT published (active) global model, coordinator-signed. This is
+    the endpoint orgs poll to pick up the latest model after a round is
+    published. 404 until the first version has been published."""
+    from pathlib import Path
+    gm = _store(request).get_active_global_model()
+    if not gm:
+        raise HTTPException(404, "No global model has been published yet")
+    p = Path(gm["model_path"])
+    if not p.exists():
+        raise HTTPException(404, "Active global model file missing on disk")
+    resp = _signed_model_response(request, gm["round_id"], p.read_bytes())
+    resp["version_id"] = gm["version_id"]
+    resp["status"] = "active"
+    return resp
+
+
+@router.get("/rounds/{round_id}/global-model")
+async def get_round_global_model(
+    round_id: int,
+    request: Request,
+    org_id: str = Depends(get_authenticated_org_id),
+):
+    """The published global model produced from a SPECIFIC round (history). Only
+    available once that round has been published (status 'completed'); a staged-
+    but-not-yet-published round returns 409."""
+    from pathlib import Path
+    store = _store(request)
+    r = store.get_round(round_id)
+    if not r:
+        raise HTTPException(404, f"Round not found: {round_id}")
+    if r["status"] != "completed":
+        raise HTTPException(
+            409, f"Round {round_id} model not published yet (status {r['status']})")
+    p = Path(request.app.state.fl_model_dir) / f"round_{round_id}.json"
+    if not p.exists():
+        raise HTTPException(404, f"Aggregated model file missing for round {round_id}")
+    return _signed_model_response(request, round_id, p.read_bytes())
 
 
 # ── Aggregation (combine accepted matrices into the global model) ───────────
@@ -622,19 +774,25 @@ async def aggregate_round(
     user: FLUser = Depends(fl_require("fl_aggregate_round")),
 ):
     """
-    Combine every accepted contribution for a round into one global model.
+    Combine every accepted contribution for a round into one STAGED global model.
 
     Pipeline:
-      1. Round must be 'running'.
+      1. Round must be 'running' AND past its intake/observation window.
       2. Load each accepted contribution's persisted model bytes.
       3. Trust-validate each (structure + public-validation accuracy + sudden-
          drop poisoning check); persist updated trust scores; EXCLUDE orgs
          below the trust floor (SR-05).
-      4. Federated-bagging merge of survivors, weighted by trust x num_examples.
-      5. Persist round_{id}.json, mark the round completed, audit.
+      4. Feature-schema gate: every matrix bagged into the global model MUST
+         share one feature space (same feature_names / num_feature). Survivors
+         whose schema differs from the heaviest survivor's are excluded — bagging
+         misaligned feature spaces silently corrupts the global model.
+      5. Federated-bagging merge of survivors, weighted by trust x num_examples.
+      6. Persist round_{id}.json + record it as a STAGED global-model version that
+         soaks under observation; round -> 'aggregated'. (completed_at unset.)
 
-    The aggregated model is then served, coordinator-signed, by
-    GET /rounds/{round_id}/global-model.
+    The staged model is NOT served to orgs. The operator promotes it with
+    POST /rounds/{round_id}/publish after the soak window, then it is served
+    (coordinator-signed) by GET /global-model.
     """
     from pathlib import Path
 
@@ -645,6 +803,17 @@ async def aggregate_round(
     if r["status"] != "running":
         raise HTTPException(409, f"Round {round_id} is not running ({r['status']})")
 
+    # Intake/observation window: contributions are collected + observed before
+    # they can be combined. Refuse to aggregate until the window elapses.
+    obs_hours = float((r.get("params") or {}).get("observation_hours", 0) or 0)
+    remaining = (r["started_at"] + obs_hours * 3600) - time.time()
+    if remaining > 0:
+        raise HTTPException(
+            409,
+            f"Round {round_id} still in intake/observation for {int(remaining)}s "
+            f"more (window {obs_hours}h); contributions are still being collected",
+        )
+
     tm = getattr(request.app.state, "trust_manager", None)
     if tm is None:
         raise HTTPException(503, "Trust manager not initialised")
@@ -654,7 +823,7 @@ async def aggregate_round(
         raise HTTPException(422, "No accepted contributions to aggregate")
 
     coord_priv = request.app.state.fl_coord_priv
-    weighted: list[tuple[bytes, float]] = []
+    survivors_raw: list[tuple[str, bytes, float]] = []   # (org_id, model_bytes, weight)
     results: list[dict] = []
     trust_updates: list[dict] = []
     for c in accepted:
@@ -670,7 +839,7 @@ async def aggregate_round(
                         "accuracy": ev["accuracy"], "trust": ev["trust"],
                         "reason": ev["reason"]})
         if ev["accepted"]:
-            weighted.append((mb, ev["weight"]))
+            survivors_raw.append((c["org_id"], mb, ev["weight"]))
         # Signed, non-repudiable per-org trust-update notification.
         if coord_priv is not None:
             tu = build_trust_notification_attestation(
@@ -682,7 +851,7 @@ async def aggregate_round(
                 "signature_hex":      att_sign(coord_priv, tu).hex(),
             })
 
-    if not weighted:
+    if not survivors_raw:
         # Everyone failed validation — leave the round running for the operator
         # to investigate. Trust changes have already been persisted.
         raise HTTPException(
@@ -691,14 +860,55 @@ async def aggregate_round(
             "round left running",
         )
 
+    # ── Feature-schema consistency gate (step 4) ─────────────────────────────
+    # All bagged matrices must share one feature space. Canonical = the schema
+    # of the heaviest survivor; any survivor that disagrees is demoted to
+    # rejected so its tree splits never land in a misaligned global model.
+    survivors_raw.sort(key=lambda t: t[2], reverse=True)
+    canonical = model_feature_schema(survivors_raw[0][1])
+    weighted: list[tuple[bytes, float]] = []
+    excluded_schema: list[str] = []
+    for oid, mb, w in survivors_raw:
+        if model_feature_schema(mb) == canonical:
+            weighted.append((mb, w))
+        else:
+            reason = (f"feature-schema mismatch (expected {describe_schema(canonical)}, "
+                      f"got {describe_schema(model_feature_schema(mb))})")
+            for x in results:
+                if x["org_id"] == oid:
+                    x["accepted"] = False
+                    x["reason"] = reason
+            excluded_schema.append(oid)
+            logger.warning("contribution excluded — feature-schema mismatch",
+                           org=oid, round_id=round_id,
+                           expected=describe_schema(canonical))
+    if excluded_schema:
+        _audit(request).log(
+            action="fl.round.schema_mismatch", actor=user.username,
+            target=f"round_{round_id}",
+            details={"canonical": describe_schema(canonical),
+                     "excluded_orgs": excluded_schema},
+        )
+
     global_bytes, info = merge_xgboost_models(weighted)
     model_dir = Path(request.app.state.fl_model_dir)
     (model_dir / f"round_{round_id}.json").write_bytes(global_bytes)
     global_hash = hashlib.sha256(global_bytes).hexdigest()
 
     survivors = [x["org_id"] for x in results if x["accepted"]]
+
+    # Stage the merged model under observation. The operator publishes it after
+    # the soak window via POST /rounds/{id}/publish; round -> 'aggregated'. The
+    # model is NOT served to orgs until promoted to 'active'.
+    staged_until = time.time() + obs_hours * 3600
+    version_id = store.stage_global_model(
+        round_id, model_hash=global_hash,
+        model_path=str(model_dir / f"round_{round_id}.json"),
+        staged_until=staged_until,
+        eval_metrics={"merge": info, "contributors": results},
+    )
     store.complete_round(
-        round_id, status="completed",
+        round_id, status="aggregated",
         responded=len(accepted), accepted=len(survivors),
         rejected=len(accepted) - len(survivors),
         global_model_hash=global_hash,
@@ -707,18 +917,100 @@ async def aggregate_round(
     _audit(request).log(
         action="fl.round.aggregated", actor=user.username,
         target=f"round_{round_id}",
-        details={"global_model_sha256": global_hash[:16],
+        details={"version_id": version_id, "global_model_sha256": global_hash[:16],
                  "accepted": survivors, "total_trees": info["total_trees"]},
     )
     return {
         "round_id":            round_id,
-        "status":              "completed",
+        "status":              "aggregated",
+        "version_id":          version_id,
         "global_model_sha256": global_hash,
         "accepted_orgs":       survivors,
         "rejected":            [x for x in results if not x["accepted"]],
         "merge":               info,
+        "staged_until":        staged_until,
         "trust_updates":       trust_updates,
     }
+
+
+# ── Global-model versioning: publish (promote staged) + rollback ────────────
+
+@router.post("/rounds/{round_id}/publish")
+async def publish_round_model(
+    round_id: int,
+    request: Request,
+    user: FLUser = Depends(fl_require("fl_aggregate_round")),
+):
+    """
+    Promote a round's STAGED global model to 'active' (published) after its soak
+    window elapses, archiving the previously-active version. Only after this are
+    orgs served the model (GET /global-model). Operator-triggered.
+    """
+    store = _store(request)
+    r = store.get_round(round_id)
+    if not r:
+        raise HTTPException(404, f"Round not found: {round_id}")
+    staged = store.get_staged_model_for_round(round_id)
+    if not staged:
+        raise HTTPException(409, f"Round {round_id} has no staged model — aggregate first")
+    remaining = staged["staged_until"] - time.time()
+    if remaining > 0:
+        raise HTTPException(
+            409,
+            f"Staged model v{staged['version_id']} still under observation for "
+            f"{int(remaining)}s more; publish refused until the soak window elapses",
+        )
+    gm = store.promote_global_model(staged["version_id"], user.username)
+    store.set_round_status(round_id, "completed")
+    _audit(request).log(
+        action="fl.global_model.publish", actor=user.username,
+        target=f"round_{round_id}",
+        details={"version_id": gm["version_id"], "model_sha256": gm["model_hash"][:16]},
+    )
+    return {"version_id": gm["version_id"], "round_id": round_id,
+            "status": "active", "model_sha256": gm["model_hash"],
+            "promoted_at": gm["promoted_at"]}
+
+
+@router.get("/models")
+async def list_global_models(
+    request: Request,
+    limit: int = 50,
+    user: FLUser = Depends(fl_require("fl_view_rounds")),
+):
+    """Version history of every global model: staged | active | archived."""
+    return {"models": _store(request).list_global_models(limit=limit),
+            "active": _store(request).get_active_global_model()}
+
+
+@router.post("/models/{version_id}/rollback")
+async def rollback_global_model(
+    version_id: int,
+    request: Request,
+    user: FLUser = Depends(fl_require("fl_aggregate_round")),
+):
+    """
+    Roll the published global model back to a previous version: make
+    `version_id` active and archive the currently-active one. Refuses to
+    activate a version still under observation (staged).
+    """
+    store = _store(request)
+    target = store.get_global_model(version_id)
+    if not target:
+        raise HTTPException(404, f"Unknown global-model version: {version_id}")
+    if target["status"] == "staged":
+        raise HTTPException(
+            409, f"Version {version_id} is still staged/under observation — "
+                 "publish it normally rather than rolling back to it")
+    gm = store.promote_global_model(version_id, user.username)
+    _audit(request).log(
+        action="fl.global_model.rollback", actor=user.username,
+        target=f"version_{version_id}",
+        details={"version_id": version_id, "round_id": gm["round_id"],
+                 "model_sha256": gm["model_hash"][:16]},
+    )
+    return {"version_id": version_id, "round_id": gm["round_id"],
+            "status": "active", "model_sha256": gm["model_hash"]}
 
 
 # ── Audit ──────────────────────────────────────────────────────────────────

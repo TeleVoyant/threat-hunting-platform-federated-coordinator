@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Global models · FL Coordinator{% endblock %}
+{% block heading %}Global models{% endblock %}
+{% block content %}
+<div x-data="modelsPage()" x-init="load()">
+  <div class="card" style="margin-bottom:16px" x-show="active">
+    <h2>Currently published (active)</h2>
+    <div class="row">
+      <div class="stat"><div class="n" x-text="active? 'v'+active.version_id : '—'"></div>
+        <div class="muted" x-text="active? ('round '+active.round_id+' · promoted '+ago(active.promoted_at)+' by '+(active.promoted_by||'?')) : ''"></div></div>
+    </div>
+    <div class="mono muted" style="margin-top:6px" x-text="active? active.model_hash : ''"></div>
+  </div>
+
+  <div class="card">
+    <div class="between"><h2 style="margin:0">Version history</h2>
+      <button class="btn btn-sm" @click="load()"><i data-lucide="refresh-cw"></i> Refresh</button></div>
+    <table style="margin-top:10px">
+      <thead><tr><th>Version</th><th>Round</th><th>Status</th><th>Created</th><th>Hash</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="m in models" :key="m.version_id">
+          <tr>
+            <td class="mono" x-text="'v'+m.version_id"></td>
+            <td class="mono" x-text="m.round_id"></td>
+            <td><span class="pill" :class="'p-'+m.status" x-text="m.status"></span></td>
+            <td class="muted" x-text="ago(m.created_at)"></td>
+            <td class="mono muted" x-text="m.model_hash? m.model_hash.slice(0,12)+'…':'—'"></td>
+            <td style="text-align:right">
+              {% if perms.fl_aggregate_round %}
+              <button class="btn btn-sm" x-show="m.status==='archived'" :disabled="busy" @click="rollback(m)">
+                <i data-lucide="history"></i> Activate</button>
+              {% endif %}
+              <span x-show="m.status==='active'" class="muted">current</span>
+              <span x-show="m.status==='staged'" class="muted">awaiting publish</span>
+            </td>
+          </tr>
+        </template>
+        <tr x-show="models.length===0"><td colspan="6" class="empty">No global models yet — aggregate &amp; publish a round.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function modelsPage(){
+  return {
+    models:[], active:null, busy:false,
+    async load(){ try{ const m=await apiGet('/fl/models'); this.models=m.models||[]; this.active=m.active; }
+      catch(e){toast(e.message,'error')} this.$nextTick(()=>window.lucide&&lucide.createIcons()); },
+    async rollback(m){
+      if(!confirm('Roll the active global model back to v'+m.version_id+' (round '+m.round_id+')?'))return;
+      this.busy=true;
+      try{ await apiPost('/fl/models/'+m.version_id+'/rollback'); toast('Rolled back to v'+m.version_id,'ok'); }
+      catch(e){ toast('Rollback: '+e.message,'error'); } finally{ this.busy=false; await this.load(); }
+    },
+  }
+}
+</script>
+{% endblock %}

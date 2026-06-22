@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Rounds · FL Coordinator{% endblock %}
+{% block heading %}Federated rounds{% endblock %}
+{% block content %}
+<div x-data="roundsPage()" x-init="load()">
+
+  {% if perms.fl_start_round %}
+  <div class="card" style="margin-bottom:16px">
+    <h2>Start a round</h2>
+    <div class="form-grid">
+      <div class="field"><label class="f">DP epsilon</label>
+        <input class="input" type="number" step="0.1" x-model.number="f.epsilon"></div>
+      <div class="field"><label class="f">Local boost rounds</label>
+        <input class="input" type="number" x-model.number="f.num_boost_rounds"></div>
+      <div class="field"><label class="f">Min clients</label>
+        <input class="input" type="number" x-model.number="f.min_clients"></div>
+      <div class="field"><label class="f">Observation window (hours) · 0 = no wait</label>
+        <input class="input" type="number" step="0.1" x-model.number="f.observation_hours"></div>
+    </div>
+    <div class="field"><label class="f">Invite (optional) — comma-separated org IDs; blank = all active</label>
+      <input class="input" x-model="f.targets" placeholder="udom, hospital"></div>
+    <button class="btn btn-primary" :disabled="busy" @click="start()"><i data-lucide="play"></i> Start round</button>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <div class="between"><h2 style="margin:0">Rounds</h2>
+      <button class="btn btn-sm" @click="load()"><i data-lucide="refresh-cw"></i> Refresh</button></div>
+    <table style="margin-top:10px">
+      <thead><tr><th>#</th><th>Status</th><th>Started</th><th>Invited</th><th>Accepted</th><th>Model</th><th></th></tr></thead>
+      <tbody>
+        <template x-for="r in rounds" :key="r.round_id">
+          <tr>
+            <td class="mono" x-text="r.round_id"></td>
+            <td><span class="pill" :class="'p-'+r.status" x-text="r.status"></span></td>
+            <td class="muted" x-text="ago(r.started_at)"></td>
+            <td class="tabnum" x-text="r.num_clients_invited"></td>
+            <td class="tabnum" x-text="r.num_clients_accepted"></td>
+            <td class="mono muted" x-text="r.global_model_hash? r.global_model_hash.slice(0,10)+'…':'—'"></td>
+            <td style="text-align:right"><a class="btn btn-sm" :href="'/dashboard/rounds/'+r.round_id">Open</a></td>
+          </tr>
+        </template>
+        <tr x-show="rounds.length===0"><td colspan="7" class="empty">No rounds yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function roundsPage(){
+  return {
+    rounds:[], busy:false,
+    f:{epsilon:1.0,num_boost_rounds:10,min_clients:2,observation_hours:0,targets:''},
+    async load(){ try{ this.rounds=(await apiGet('/fl/rounds')).rounds||[] }catch(e){toast(e.message,'error')}
+      this.$nextTick(()=>window.lucide&&lucide.createIcons()); },
+    async start(){
+      this.busy=true;
+      const body={epsilon:this.f.epsilon,num_boost_rounds:this.f.num_boost_rounds,
+        min_clients:this.f.min_clients,observation_hours:this.f.observation_hours};
+      const t=this.f.targets.split(',').map(s=>s.trim()).filter(Boolean);
+      if(t.length) body.target_org_ids=t;
+      try{ const r=await apiPost('/fl/rounds/start',body); toast('Round '+r.round_id+' started','ok');
+        location.href='/dashboard/rounds/'+r.round_id; }
+      catch(e){ toast('Start failed: '+e.message,'error'); this.busy=false; }
+    },
+  }
+}
+</script>
+{% endblock %}

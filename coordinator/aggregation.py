@@ -31,6 +31,38 @@ from typing import Sequence, Tuple
 _MAX_GLOBAL_TREES = 500
 
 
+def model_feature_schema(raw) -> tuple:
+    """A comparable feature-schema key for an XGBoost JSON model.
+
+    Returns ("names", (name, ...)) when the model carries feature_names — the
+    strong check, which also catches a different feature ORDER — else
+    ("dim", num_feature) as a weaker fallback. Two contributions that share this
+    key were trained on the same feature space (same columns, same order) and
+    can be safely bagged. Bagging trees from models with DIFFERENT keys yields a
+    global model whose tree split indices reference misaligned features — a
+    silent correctness bug — which is why the merge refuses it.
+    """
+    mj = raw if isinstance(raw, dict) else json.loads(raw)
+    learner = mj.get("learner", {}) or {}
+    names = learner.get("feature_names") or []
+    if names:
+        return ("names", tuple(names))
+    try:
+        nfeat = int((learner.get("learner_model_param") or {}).get("num_feature", 0))
+    except (TypeError, ValueError):
+        nfeat = 0
+    return ("dim", nfeat)
+
+
+def describe_schema(schema: tuple) -> str:
+    """Human-readable rendering of a model_feature_schema() key for errors/audit."""
+    kind, val = schema
+    if kind == "names":
+        shown = ", ".join(val[:6]) + ("…" if len(val) > 6 else "")
+        return f"{len(val)} features [{shown}]"
+    return f"{val} features (unnamed)"
+
+
 def _get_trees(model_json: dict) -> list:
     """Extract the tree list from an XGBoost JSON model dict."""
     return (
@@ -96,6 +128,17 @@ def merge_xgboost_models(
 
     if not parsed:
         raise ValueError("No usable models to aggregate")
+
+    # Defensive: refuse to bag models trained on different feature spaces — their
+    # tree split indices reference misaligned features (silent corruption). The
+    # aggregate endpoint pre-filters to one schema, so this is a backstop that
+    # also protects any other caller.
+    schemas = {model_feature_schema(mj) for mj, _ in parsed}
+    if len(schemas) > 1:
+        raise ValueError(
+            "feature-schema mismatch across contributions: "
+            + " vs ".join(sorted(describe_schema(s) for s in schemas))
+        )
 
     total_weight = sum(w for _, w in parsed) or 1.0
 

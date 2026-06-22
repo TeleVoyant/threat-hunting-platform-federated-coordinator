@@ -39,15 +39,21 @@ class TrustManager:
         min_accuracy: float = 0.5,
         max_accuracy_drop: float = 0.15,
         min_trust: float = 0.3,
+        max_num_examples: int = 1_000_000,
     ):
         self.store = store
         self.validation_data = validation_data
         self.min_accuracy = min_accuracy
         self.max_accuracy_drop = max_accuracy_drop
         self.min_trust = min_trust
-        # Per-org last-accuracy for the sudden-drop heuristic. In-process only
-        # (resets on restart); the durable trust SCORE lives in the DB.
-        self._last_accuracy: dict[str, float] = {}
+        # Self-reported num_examples feeds the aggregation weight (trust x
+        # num_examples); cap it so a single org cannot inflate its share of the
+        # merged ensemble with a fabricated dataset size.
+        self.max_num_examples = max_num_examples
+        # The sudden-drop baseline (per-org last accuracy) is PERSISTED in the
+        # orgs table via store.get/set_org_last_accuracy, so the heuristic
+        # survives a coordinator restart. The durable trust SCORE also lives
+        # in the DB.
 
     def _bump(self, org_id: str, delta: float) -> float:
         org = self.store.get_org(org_id) or {}
@@ -92,8 +98,10 @@ class TrustManager:
                 accuracy = float(np.mean((preds > 0.5).astype(int) == labels))
             except Exception as e:
                 new = self._bump(org_id, -0.1)
+                # Keep only the first line — XGBoost errors carry a long C stack.
+                msg = str(e).splitlines()[0] if str(e) else type(e).__name__
                 return {"accepted": False, "trust": new, "weight": 0.0,
-                        "accuracy": None, "reason": f"evaluation failed: {e}"}
+                        "accuracy": None, "reason": f"evaluation failed: {msg}"}
 
             # Minimum accuracy gate.
             if accuracy < self.min_accuracy:
@@ -103,8 +111,9 @@ class TrustManager:
                         "accuracy": accuracy,
                         "reason": f"accuracy {accuracy:.2%} below {self.min_accuracy:.2%}"}
 
-            # Sudden-drop poisoning heuristic vs the org's previous round.
-            prev = self._last_accuracy.get(org_id)
+            # Sudden-drop poisoning heuristic vs the org's previous round
+            # (baseline persisted in the DB — survives coordinator restarts).
+            prev = self.store.get_org_last_accuracy(org_id)
             if prev is not None and (prev - accuracy) > self.max_accuracy_drop:
                 new = self._bump(org_id, -0.2)
                 logger.warning("suspicious accuracy drop", org=org_id,
@@ -112,11 +121,17 @@ class TrustManager:
                 return {"accepted": False, "trust": new, "weight": 0.0,
                         "accuracy": accuracy,
                         "reason": f"suspicious accuracy drop {prev - accuracy:.2%}"}
-            self._last_accuracy[org_id] = accuracy
+            self.store.set_org_last_accuracy(org_id, accuracy)
 
         # ── Accepted -- slowly recover trust for consistently good orgs ────
         new = self._bump(org_id, +0.02)
-        weight = new * float(max(num_examples, 1))
+        # Clamp self-reported num_examples before it becomes aggregation weight.
+        reported = max(int(num_examples), 1)
+        capped = min(reported, self.max_num_examples)
+        if reported > self.max_num_examples:
+            logger.warning("num_examples clamped for aggregation weight",
+                           org=org_id, reported=reported, cap=self.max_num_examples)
+        weight = new * float(capped)
         logger.info("contribution validated", org=org_id, accuracy=accuracy, trust=new)
         return {"accepted": True, "trust": new, "weight": weight,
                 "accuracy": accuracy, "reason": "accepted"}

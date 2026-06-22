@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS orgs (
     status           TEXT NOT NULL DEFAULT 'active',
     trust_score      REAL NOT NULL DEFAULT 1.0,
     last_seen_at     REAL,
+    last_accuracy    REAL,                             -- last validation accuracy (poisoning sudden-drop baseline; persisted so it survives restarts)
     notes            TEXT
 );
 
@@ -48,7 +49,9 @@ CREATE TABLE IF NOT EXISTS rounds (
     num_clients_accepted  INTEGER NOT NULL DEFAULT 0,
     num_clients_rejected  INTEGER NOT NULL DEFAULT 0,
     global_model_hash     TEXT,
-    eval_metrics_json     TEXT
+    eval_metrics_json     TEXT,
+    announce_attestation  BLOB,                         -- coordinator-signed round announcement (canonical-JSON bytes)
+    announce_signature    TEXT                          -- hex Ed25519 signature over announce_attestation
 );
 
 -- One-shot challenge tokens issued per (org, round). Bound and consumed
@@ -86,10 +89,30 @@ CREATE TABLE IF NOT EXISTS contributions (
     FOREIGN KEY(org_id)   REFERENCES orgs(org_id)
 );
 
+-- Versioned global models. Aggregation produces a 'staged' version that soaks
+-- under observation; the operator promotes it to 'active' (the published model
+-- served to orgs) after the soak window, archiving the previously-active one.
+-- Rollback re-activates an archived version. One 'active' row at a time.
+CREATE TABLE IF NOT EXISTS global_models (
+    version_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id          INTEGER NOT NULL,
+    created_at        REAL NOT NULL,
+    staged_until      REAL NOT NULL,                  -- soak end; publish allowed after this
+    status            TEXT NOT NULL DEFAULT 'staged', -- staged | active | archived
+    model_hash        TEXT NOT NULL,
+    model_path        TEXT NOT NULL,
+    promoted_at       REAL,
+    promoted_by       TEXT,
+    eval_metrics_json TEXT,
+    FOREIGN KEY(round_id) REFERENCES rounds(round_id)
+);
+
 CREATE INDEX IF NOT EXISTS ix_orgs_status        ON orgs(status);
 CREATE INDEX IF NOT EXISTS ix_rounds_started_at  ON rounds(started_at DESC);
 CREATE INDEX IF NOT EXISTS ix_challenges_org_rnd ON challenges(org_id, round_id);
 CREATE INDEX IF NOT EXISTS ix_contrib_round      ON contributions(round_id, org_id);
+CREATE INDEX IF NOT EXISTS ix_gm_status          ON global_models(status);
+CREATE INDEX IF NOT EXISTS ix_gm_round           ON global_models(round_id);
 """
 
 
@@ -101,10 +124,18 @@ class CoordinatorStore:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(_SCHEMA)
-        # Defensive migration: add model_path to an older contributions table.
+        # Defensive migrations: add columns to tables created by an older schema.
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(contributions)")}
         if "model_path" not in cols:
             self.conn.execute("ALTER TABLE contributions ADD COLUMN model_path TEXT")
+        ocols = {r[1] for r in self.conn.execute("PRAGMA table_info(orgs)")}
+        if "last_accuracy" not in ocols:
+            self.conn.execute("ALTER TABLE orgs ADD COLUMN last_accuracy REAL")
+        rcols = {r[1] for r in self.conn.execute("PRAGMA table_info(rounds)")}
+        if "announce_attestation" not in rcols:
+            self.conn.execute("ALTER TABLE rounds ADD COLUMN announce_attestation BLOB")
+        if "announce_signature" not in rcols:
+            self.conn.execute("ALTER TABLE rounds ADD COLUMN announce_signature TEXT")
         self.conn.commit()
         self._lock = Lock()
 
@@ -351,6 +382,22 @@ class CoordinatorStore:
             )
             self.conn.commit()
 
+    def get_org_last_accuracy(self, org_id: str) -> Optional[float]:
+        """Persisted last-round validation accuracy for the sudden-drop
+        poisoning heuristic. None when the org has not been scored yet."""
+        row = self.conn.execute(
+            "SELECT last_accuracy FROM orgs WHERE org_id = ?", (org_id,),
+        ).fetchone()
+        return row["last_accuracy"] if row and row["last_accuracy"] is not None else None
+
+    def set_org_last_accuracy(self, org_id: str, accuracy: float) -> None:
+        with self._lock:
+            self.conn.execute(
+                "UPDATE orgs SET last_accuracy = ? WHERE org_id = ?",
+                (float(accuracy), org_id),
+            )
+            self.conn.commit()
+
     # ── Rounds ─────────────────────────────────────────────────────────────
 
     def start_round(
@@ -368,6 +415,19 @@ class CoordinatorStore:
             self.conn.commit()
         return cur.lastrowid
 
+    def set_round_announcement(
+        self, round_id: int, attestation: bytes, signature_hex: str,
+    ) -> None:
+        """Persist the coordinator-signed announcement for a round so invited
+        orgs can fetch + verify it (GET /rounds/{id}/announcement)."""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE rounds SET announce_attestation = ?, "
+                "announce_signature = ? WHERE round_id = ?",
+                (attestation, signature_hex, round_id),
+            )
+            self.conn.commit()
+
     def complete_round(
         self,
         round_id: int,
@@ -379,13 +439,17 @@ class CoordinatorStore:
         global_model_hash: Optional[str] = None,
         eval_metrics: Optional[dict] = None,
     ) -> None:
+        # completed_at is only meaningful once the round is actually completed
+        # (published). For the intermediate 'aggregated' state it stays NULL and
+        # is stamped later by set_round_status('completed').
+        completed_at = time.time() if status == "completed" else None
         with self._lock:
             self.conn.execute(
                 "UPDATE rounds SET completed_at = ?, status = ?, "
                 "num_clients_responded = ?, num_clients_accepted = ?, "
                 "num_clients_rejected = ?, global_model_hash = ?, "
                 "eval_metrics_json = ? WHERE round_id = ?",
-                (time.time(), status, responded, accepted, rejected,
+                (completed_at, status, responded, accepted, rejected,
                  global_model_hash,
                  json.dumps(eval_metrics) if eval_metrics else None,
                  round_id),
@@ -404,6 +468,15 @@ class CoordinatorStore:
             d["eval_metrics"] = json.loads(d.pop("eval_metrics_json"))
         else:
             d.pop("eval_metrics_json", None)
+        # Surface the signed announcement as a JSON-safe sub-object; never leak
+        # the raw BLOB column (would break JSON serialisation of GET /rounds/{id}).
+        ann = d.pop("announce_attestation", None)
+        sig = d.pop("announce_signature", None)
+        if ann is not None:
+            d["round_announcement"] = {
+                "signed_attestation": ann.decode("utf-8") if isinstance(ann, (bytes, bytearray)) else ann,
+                "signature_hex": sig,
+            }
         return d
 
     def list_rounds(self, limit: int = 50) -> list[dict]:
@@ -413,5 +486,103 @@ class CoordinatorStore:
             "num_clients_rejected, global_model_hash "
             "FROM rounds ORDER BY started_at DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_rounds_by_status(self, status: str) -> list[dict]:
+        """Full round dicts (incl. params) for every round in a given status —
+        used by org-facing round discovery."""
+        rows = self.conn.execute(
+            "SELECT round_id FROM rounds WHERE status = ? ORDER BY started_at DESC",
+            (status,),
+        ).fetchall()
+        return [self.get_round(r["round_id"]) for r in rows]
+
+    def set_round_status(self, round_id: int, status: str) -> None:
+        # Stamp completed_at when (and only when) the round reaches 'completed'
+        # (i.e. its global model is published).
+        with self._lock:
+            if status == "completed":
+                self.conn.execute(
+                    "UPDATE rounds SET status = ?, completed_at = ? WHERE round_id = ?",
+                    (status, time.time(), round_id),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE rounds SET status = ? WHERE round_id = ?", (status, round_id),
+                )
+            self.conn.commit()
+
+    # ── Versioned global models (staged -> active -> archived + rollback) ────
+
+    def _gm_row(self, row) -> Optional[dict]:
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("eval_metrics_json"):
+            d["eval_metrics"] = json.loads(d.pop("eval_metrics_json"))
+        else:
+            d.pop("eval_metrics_json", None)
+        return d
+
+    def stage_global_model(
+        self, round_id: int, *, model_hash: str, model_path: str,
+        staged_until: float, eval_metrics: Optional[dict] = None,
+    ) -> int:
+        """Record a freshly-merged global model as a 'staged' version that soaks
+        under observation until `staged_until`. Returns its version_id."""
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO global_models(round_id, created_at, staged_until, "
+                "status, model_hash, model_path, eval_metrics_json) "
+                "VALUES (?, ?, ?, 'staged', ?, ?, ?)",
+                (round_id, time.time(), staged_until, model_hash, model_path,
+                 json.dumps(eval_metrics) if eval_metrics else None),
+            )
+            self.conn.commit()
+        return cur.lastrowid
+
+    def get_global_model(self, version_id: int) -> Optional[dict]:
+        return self._gm_row(self.conn.execute(
+            "SELECT * FROM global_models WHERE version_id = ?", (version_id,),
+        ).fetchone())
+
+    def get_staged_model_for_round(self, round_id: int) -> Optional[dict]:
+        return self._gm_row(self.conn.execute(
+            "SELECT * FROM global_models WHERE round_id = ? AND status = 'staged' "
+            "ORDER BY created_at DESC LIMIT 1", (round_id,),
+        ).fetchone())
+
+    def get_active_global_model(self) -> Optional[dict]:
+        return self._gm_row(self.conn.execute(
+            "SELECT * FROM global_models WHERE status = 'active' "
+            "ORDER BY promoted_at DESC LIMIT 1",
+        ).fetchone())
+
+    def promote_global_model(self, version_id: int, promoted_by: str) -> Optional[dict]:
+        """Make `version_id` the active (published) global model, archiving the
+        previously-active one. Serves both first-publish and rollback. Returns
+        the promoted row, or None if the version doesn't exist."""
+        with self._lock:
+            exists = self.conn.execute(
+                "SELECT 1 FROM global_models WHERE version_id = ?", (version_id,),
+            ).fetchone()
+            if not exists:
+                return None
+            self.conn.execute(
+                "UPDATE global_models SET status = 'archived' WHERE status = 'active'")
+            self.conn.execute(
+                "UPDATE global_models SET status = 'active', promoted_at = ?, "
+                "promoted_by = ? WHERE version_id = ?",
+                (time.time(), promoted_by, version_id),
+            )
+            self.conn.commit()
+        return self.get_global_model(version_id)
+
+    def list_global_models(self, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT version_id, round_id, created_at, staged_until, status, "
+            "model_hash, promoted_at, promoted_by FROM global_models "
+            "ORDER BY version_id DESC LIMIT ?", (limit,),
         ).fetchall()
         return [dict(r) for r in rows]

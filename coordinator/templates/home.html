@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}Overview · FL Coordinator{% endblock %}
+{% block heading %}Overview{% endblock %}
+{% block content %}
+<div x-data="home()" x-init="load()">
+  <div class="grid cards">
+    <div class="card stat"><div class="l">Organizations</div>
+      <div class="n" x-text="orgs.length"></div>
+      <div class="muted" x-text="orgActive + ' active · ' + orgBlocked + ' blocked'"></div></div>
+    <div class="card stat"><div class="l">Rounds</div>
+      <div class="n" x-text="rounds.length"></div>
+      <div class="muted" x-text="running + ' running · ' + aggregated + ' staged'"></div></div>
+    <div class="card stat"><div class="l">Active global model</div>
+      <div class="n" x-text="active ? ('v'+active.version_id) : '—'"></div>
+      <div class="muted" x-text="active ? ('round '+active.round_id) : 'none published'"></div></div>
+    <div class="card stat"><div class="l">Model versions</div>
+      <div class="n" x-text="models.length"></div>
+      <div class="muted">staged · active · archived</div></div>
+  </div>
+
+  <div class="grid" style="grid-template-columns:1fr 1fr;margin-top:14px">
+    <div class="card">
+      <div class="between"><h2 style="margin:0">Recent rounds</h2><a class="btn btn-sm" href="/dashboard/rounds">Open</a></div>
+      <table style="margin-top:8px">
+        <thead><tr><th>#</th><th>Status</th><th>Started</th></tr></thead>
+        <tbody>
+          <template x-for="r in rounds.slice(0,6)" :key="r.round_id">
+            <tr style="cursor:pointer" @click="location.href='/dashboard/rounds/'+r.round_id">
+              <td class="mono" x-text="r.round_id"></td>
+              <td><span class="pill" :class="'p-'+r.status" x-text="r.status"></span></td>
+              <td class="muted" x-text="ago(r.started_at)"></td>
+            </tr>
+          </template>
+          <tr x-show="rounds.length===0"><td colspan="3" class="empty">No rounds yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="between"><h2 style="margin:0">Recent audit</h2><a class="btn btn-sm" href="/dashboard/audit">Open</a></div>
+      <table style="margin-top:8px">
+        <thead><tr><th>Action</th><th>Actor</th><th>When</th></tr></thead>
+        <tbody>
+          <template x-for="a in audit.slice(0,7)" :key="a.id">
+            <tr><td class="mono" x-text="a.action"></td><td x-text="a.actor"></td>
+              <td class="muted" x-text="ago(a.timestamp)"></td></tr>
+          </template>
+          <tr x-show="audit.length===0"><td colspan="3" class="empty">No activity yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function home(){
+  return {
+    orgs:[], rounds:[], models:[], active:null, audit:[],
+    get orgActive(){return this.orgs.filter(o=>o.status==='active').length},
+    get orgBlocked(){return this.orgs.filter(o=>o.status==='blocked').length},
+    get running(){return this.rounds.filter(r=>r.status==='running').length},
+    get aggregated(){return this.rounds.filter(r=>r.status==='aggregated').length},
+    async load(){
+      try{ this.orgs=(await apiGet('/fl/orgs')).orgs||[] }catch(e){}
+      try{ this.rounds=(await apiGet('/fl/rounds')).rounds||[] }catch(e){}
+      try{ const m=await apiGet('/fl/models'); this.models=m.models||[]; this.active=m.active }catch(e){}
+      try{ this.audit=(await apiGet('/fl/audit?limit=8')).entries||[] }catch(e){}
+      this.$nextTick(()=>window.lucide&&lucide.createIcons());
+    },
+  }
+}
+</script>
+{% endblock %}

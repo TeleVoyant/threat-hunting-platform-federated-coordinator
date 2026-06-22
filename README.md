@@ -30,12 +30,16 @@ neutral consortium can run it independently of any participating org's platform.
 - **Receive** — orgs submit XGBoost models with a signed attestation; the server runs a
   7-step verification (org/round binding, SHA-256 integrity, ±5-min freshness, one-shot
   nonce, Ed25519 signature) before persisting the bytes.
-- **Combine** — on demand the server trust-validates every accepted contribution against
-  a public validation set, drops low-trust/poisoned ones, and merges the survivors by
-  **federated bagging** (tree ensembles concatenated in proportion to trust × data size,
-  capped at 500 trees).
-- **Supply** — the aggregated global model is served **coordinator-signed**, so an org can
-  prove it is authentic and untampered before loading it.
+- **Combine** — after the round's intake/observation window, the operator aggregates: the
+  server trust-validates every accepted contribution against a public validation set, drops
+  low-trust/poisoned ones, enforces a **single feature schema** across survivors (so bagged
+  tree split-indices stay aligned), and merges the rest by **federated bagging** (tree
+  ensembles concatenated in proportion to trust × data size, capped at 500 trees). The
+  result is a **staged** global-model version that soaks under observation.
+- **Supply** — after the soak window the operator **publishes** the staged version to active;
+  only then is it served (`GET /global-model`), **coordinator-signed**, so an org can prove it
+  is authentic and untampered before loading. Versions are tracked (staged → active → archived)
+  and the operator can **roll back** to a previous one.
 
 ## Security model
 
@@ -77,6 +81,15 @@ Distribute `data/ca/ca_cert.pem` to participating orgs out-of-band (it is their 
 anchor). Orgs generate an Ed25519 keypair locally and you enroll them with their public
 key; enrollment returns their CA-signed client cert + the coordinator's public key.
 
+## Operator console
+
+A self-contained web dashboard at **`/dashboard`** lets an operator run every task —
+enroll/block/revoke orgs, start rounds, aggregate, publish, roll back global models, and
+read the hash-chained audit trail — **without typing a command**. Sign in with an FL
+operator username + API key (from the roster); the session is a JWT in an HttpOnly cookie,
+and the pages drive the same `/fl/*` API, so every click is recorded in the audit chain
+with the same RBAC. Login/logout are audited too.
+
 ## Operator + org API (prefix `/fl`)
 
 | Method | Path | Who | Purpose |
@@ -84,11 +97,17 @@ key; enrollment returns their CA-signed client cert + the coordinator's public k
 | POST | `/orgs/enroll` | operator (admin) | register an org, issue its client cert |
 | GET | `/orgs` | operator | list orgs + trust scores |
 | POST | `/orgs/{id}/block` · `/unblock` · DELETE `/orgs/{id}` | operator/admin | lifecycle / revoke |
-| POST | `/rounds/start` | operator | open a round |
+| POST | `/rounds/start` | operator | open a round (sets the intake window; emits a signed announcement) |
+| GET | `/rounds/active` | org (mTLS) | discover open rounds this org is invited to |
+| GET | `/rounds/{id}/announcement` | org (mTLS) | coordinator-signed round announcement to verify |
 | GET | `/rounds/{id}/challenge` | org (mTLS) | one-shot nonce |
 | POST | `/rounds/{id}/contribute` | org (mTLS) | submit a signed model matrix |
-| POST | `/rounds/{id}/aggregate` | operator | trust-validate + combine accepted matrices |
-| GET | `/rounds/{id}/global-model` | org (mTLS) | download the coordinator-signed global model |
+| POST | `/rounds/{id}/aggregate` | operator | (after intake window) trust + schema validate → **stage** a global model |
+| POST | `/rounds/{id}/publish` | operator | (after soak window) promote the staged model to **active** |
+| GET | `/global-model` | org (mTLS) | download the current **active** coordinator-signed global model |
+| GET | `/rounds/{id}/global-model` | org (mTLS) | download a specific published round's model (history) |
+| GET | `/models` | operator | global-model version history (staged/active/archived) |
+| POST | `/models/{version}/rollback` | operator | re-activate a previous global-model version |
 | GET | `/audit` | operator | hash-chained audit trail |
 
 A reference participant client lives in [`client_ref/`](client_ref/fl_client.py).
@@ -97,9 +116,10 @@ A reference participant client lives in [`client_ref/`](client_ref/fl_client.py)
 
 ```
 flproto/       vendored, self-contained protocol core (attestation, CA, libsvm)
-coordinator/   the server: api, store, security/RBAC, mTLS, aggregation, trust, audit
+coordinator/   the server: api, store, security/RBAC, mTLS, aggregation, trust, audit,
+               dashboard (operator web console) + templates/
 client_ref/    reference org client (train -> DP -> sign -> submit -> verify)
-tests/         unit (crypto/merge/replay) + end-to-end (full round) — runnable scripts
+tests/         unit + end-to-end (full round) + dashboard — runnable scripts
 examples/      validation-set generator + end-to-end walkthrough
 ```
 

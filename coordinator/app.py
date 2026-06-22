@@ -27,11 +27,13 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI
+from fastapi.templating import Jinja2Templates
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from flproto.ca                  import load_ca, load_coordinator_keypair, load_crl
 from coordinator.api             import router as fl_router
+from coordinator.dashboard       import router as dashboard_router
 from coordinator.store           import CoordinatorStore
 from coordinator.security        import FLAuthManager, FLRole, FLUser
 from coordinator.mtls_middleware import MTLSMiddleware
@@ -130,7 +132,11 @@ def build_app() -> FastAPI:
     # Trust manager: re-scores + weights contributions at aggregation time
     # against a PUBLIC validation set (or structure-only when unset).
     validation_data = _load_validation_data(logger)
-    trust_manager = TrustManager(coordinator_store, validation_data=validation_data)
+    trust_manager = TrustManager(
+        coordinator_store,
+        validation_data=validation_data,
+        max_num_examples=int(os.environ.get("FL_MAX_NUM_EXAMPLES", 1_000_000)),
+    )
 
     app = FastAPI(
         title="APT Platform — FL Coordinator",
@@ -152,17 +158,23 @@ def build_app() -> FastAPI:
     app.state.fl_model_dir      = fl_model_dir
     app.state.trust_manager     = trust_manager
 
+    # Operator web console (Jinja2 templates under coordinator/templates).
+    app.state.templates = Jinja2Templates(
+        directory=str(Path(__file__).resolve().parent / "templates"))
+
     # mTLS middleware enriches every request with request.state.mtls_org_id
     # when a valid client cert is presented. Route dependencies decide
     # whether to require mTLS or fall back to the bootstrap API key.
     app.add_middleware(MTLSMiddleware)
 
     app.include_router(fl_router)
+    app.include_router(dashboard_router)   # /login, /dashboard/* (cookie-auth)
 
     @app.get("/")
     async def root():
         return {
             "service":    "fl-coordinator",
+            "dashboard":  "/dashboard",
             "users_loaded": len(users),
             "active_orgs": sum(
                 1 for o in coordinator_store.list_orgs() if o["status"] == "active"

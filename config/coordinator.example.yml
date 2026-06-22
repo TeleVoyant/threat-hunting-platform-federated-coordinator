@@ -15,6 +15,14 @@
 #
 # Limits / guards -----------------------------------------------------------
 # FL_MAX_MODEL_BYTES   reject contributions larger than this (default 67108864 = 64 MiB)
+# FL_MAX_NUM_EXAMPLES  cap on a contribution's self-reported num_examples when it
+#                      becomes aggregation weight (trust x num_examples), so one org
+#                      can't inflate its share of the merge (default 1000000)
+# FL_REQUIRE_MTLS=1    org endpoints accept verified mTLS only; the X-FL-API-Key
+#                      bootstrap fallback is refused. Recommended in production.
+# FL_OBSERVATION_HOURS observation window (hrs) for BOTH the round intake window and
+#                      the staged-global-model soak before publish (default 48; 0 =
+#                      no wait). Operator triggers aggregate + publish after each.
 #
 # Trust thresholds (currently set in coordinator/trust.py:TrustManager) -----
 #   min_accuracy        0.5    reject contributions scoring below this on validation

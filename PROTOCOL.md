@@ -48,8 +48,16 @@ Signed by the **coordinator**, returned with the aggregated model.
   "accepted_orgs":["<org_id>", ...], "distributed_at":"<ISO-8601 UTC>" }
 ```
 
-### 3. `fl.round_announce.v1`  (coordinator → org) — optional
-Proves a round was authorised by the coordinator (no rogue invites).
+### 3. `fl.round_announce.v1`  (coordinator → org)
+Signed by the **coordinator** when a round is started; an invited org fetches it
+from `GET /fl/rounds/{id}/announcement` (mTLS) and verifies the signature to prove
+the round was authorised by the coordinator before contributing (no rogue invites).
+Emitted only when the federation CA/coordinator keypair is loaded.
+```json
+{ "type":"fl.round_announce.v1", "round_id":<int>, "epsilon":<float>,
+  "num_boost_rounds":<int>, "invited_orgs":["<org_id>", ...],
+  "starts_at":"<ISO-8601 UTC>" }
+```
 
 ### 4. `fl.trust_update.v1`  (coordinator → org)
 Signed per-org trust change, returned by `/aggregate`; orgs keep these as proof.
@@ -84,16 +92,28 @@ org already contributed, `413` model too large.
 
 ## Aggregation + distribution
 
+A round has an intake/observation window (`FL_OBSERVATION_HOURS`, default 48h). Aggregation
+is operator-triggered AFTER the window and produces a *staged* global model that soaks for a
+second window before the operator publishes it. Set the window to 0 for no wait.
+
 ```
-operator  POST /fl/rounds/{r}/aggregate
+operator  POST /fl/rounds/{r}/aggregate          (refused 409 until intake window elapses)
               for each accepted contribution:
                   trust-validate (structure + accuracy + sudden-drop) on the public set
                   update + persist org trust; EXCLUDE if trust < 0.3
+              enforce ONE feature schema across survivors (else exclude misaligned ones)
               merge survivors by federated bagging, weight = trust x num_examples
-              write global model, mark round completed, sign fl.trust_update.v1 per org
-          ◀── 200 { global_model_sha256, accepted_orgs, rejected[], merge{}, trust_updates[] }
+              STAGE the merged model as a new version; round -> 'aggregated'
+          ◀── 200 { version_id, status:'aggregated', global_model_sha256, accepted_orgs,
+                    rejected[], merge{}, staged_until, trust_updates[] }
 
-org       GET /fl/rounds/{r}/global-model  (mTLS)
+operator  POST /fl/rounds/{r}/publish            (refused 409 until soak window elapses)
+              promote the staged version to 'active' (archive previous active); round 'completed'
+          ◀── 200 { version_id, status:'active', model_sha256 }
+          (rollback: POST /fl/models/{version}/rollback re-activates a prior version)
+
+org       GET /fl/global-model  (mTLS)           (current active version; per-round at
+                                                  /fl/rounds/{r}/global-model)
           ◀── { model_b64, signed_attestation (fl.global_model.v1), signature_hex }
               org MUST verify coordinator signature AND sha256(model)==att.model_sha256
               before loading the model.

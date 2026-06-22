@@ -74,6 +74,19 @@ def test_challenge_is_single_use_and_bound():
         assert store.consume_challenge(ch2, "other", 1) == "Challenge belongs to a different org"
 
 
+def test_org_last_accuracy_persists_across_restart():
+    # The poisoning sudden-drop baseline must survive a coordinator restart.
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/c.db"
+        store = CoordinatorStore(db_path=path)
+        store.enroll_org("udom", "UDOM", "hash", "admin")
+        assert store.get_org_last_accuracy("udom") is None      # unscored yet
+        store.set_org_last_accuracy("udom", 0.83)
+        # Re-open the DB (simulates a process restart) — value must persist.
+        store2 = CoordinatorStore(db_path=path)
+        assert abs(store2.get_org_last_accuracy("udom") - 0.83) < 1e-9
+
+
 # ── Federated bagging merge ─────────────────────────────────────────────────
 
 def _mk_model(n_trees: int, tag: str) -> bytes:
@@ -112,6 +125,41 @@ def test_merge_rejects_empty():
         assert False, "expected ValueError"
     except ValueError:
         pass
+
+
+def _mk_named_model(names) -> bytes:
+    n = 3
+    return json.dumps({"learner": {
+        "feature_names": list(names),
+        "learner_model_param": {"num_feature": str(len(names))},
+        "gradient_booster": {"model": {
+            "trees": [{"id": i} for i in range(n)],
+            "tree_info": [0] * n, "iteration_indptr": list(range(n + 1)),
+            "gbtree_model_param": {"num_trees": str(n)},
+        }}}}).encode()
+
+
+def test_feature_schema_distinguishes_order_and_dimension():
+    from coordinator.aggregation import model_feature_schema
+    abc = _mk_named_model(["auth", "dns", "proc"])
+    reordered = _mk_named_model(["dns", "auth", "proc"])   # same set, different ORDER
+    assert model_feature_schema(abc) != model_feature_schema(reordered)
+    assert model_feature_schema(abc) == model_feature_schema(_mk_named_model(["auth", "dns", "proc"]))
+
+
+def test_merge_refuses_feature_schema_mismatch():
+    # Bagging models trained on misaligned feature spaces must be refused, not
+    # silently produce a corrupt global model.
+    abc = _mk_named_model(["auth", "dns", "proc"])
+    reordered = _mk_named_model(["dns", "auth", "proc"])
+    try:
+        merge_xgboost_models([(abc, 1.0), (reordered, 1.0)])
+        assert False, "expected ValueError on feature-schema mismatch"
+    except ValueError as e:
+        assert "feature-schema mismatch" in str(e)
+    # identical schema merges cleanly
+    _, info = merge_xgboost_models([(abc, 1.0), (_mk_named_model(["auth", "dns", "proc"]), 1.0)])
+    assert info["num_models"] == 2
 
 
 # ── Differential privacy ────────────────────────────────────────────────────

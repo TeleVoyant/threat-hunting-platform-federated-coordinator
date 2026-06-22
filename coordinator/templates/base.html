@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}FL Coordinator{% endblock %}</title>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
+  <style>
+    :root{
+      --bg-0:#0b0f17; --bg-1:#131925; --bg-2:#1b2333; --bg-3:#232d40;
+      --fg-0:#e6edf6; --fg-1:#aab6c8; --fg-2:#7d8aa0;
+      --border:#243049; --border-2:#2f3b54;
+      --accent:#4f8cff; --accent-bg:rgba(79,140,255,.14);
+      --success:#2ec47e; --success-bg:rgba(46,196,126,.14);
+      --warn:#e0b341; --warn-bg:rgba(224,179,65,.14);
+      --danger:#f0556a; --danger-bg:rgba(240,85,106,.14);
+      --r:10px; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+      --sans:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    }
+    *{box-sizing:border-box} html,body{margin:0}
+    body{background:var(--bg-0);color:var(--fg-0);font:14px/1.5 var(--sans);
+      -webkit-font-smoothing:antialiased}
+    a{color:inherit;text-decoration:none}
+    .app{display:grid;grid-template-columns:230px 1fr;min-height:100vh}
+    /* ── sidebar ── */
+    .side{background:var(--bg-1);border-right:1px solid var(--border);padding:18px 12px;
+      display:flex;flex-direction:column;gap:4px}
+    .brand{display:flex;align-items:center;gap:9px;padding:6px 8px 16px;font-weight:700}
+    .brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);
+      box-shadow:0 0 12px var(--accent)}
+    .brand small{display:block;color:var(--fg-2);font-weight:500;font-size:11px}
+    .nav a{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:8px;
+      color:var(--fg-1);font-weight:500}
+    .nav a:hover{background:var(--bg-2);color:var(--fg-0)}
+    .nav a.on{background:var(--accent-bg);color:#cfe0ff}
+    .nav a i{width:17px;height:17px}
+    .side .spacer{flex:1}
+    /* ── topbar + main ── */
+    .main{display:flex;flex-direction:column;min-width:0}
+    .top{display:flex;align-items:center;justify-content:space-between;
+      padding:14px 24px;border-bottom:1px solid var(--border);background:var(--bg-0)}
+    .top h1{font-size:17px;margin:0}
+    .who{display:flex;align-items:center;gap:12px;color:var(--fg-1);font-size:13px}
+    .inner{padding:22px 24px;max-width:1180px;width:100%}
+    /* ── primitives ── */
+    .grid{display:grid;gap:14px}
+    .cards{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+    .card{background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r);padding:16px}
+    .card h2{font-size:13px;margin:0 0 12px;color:var(--fg-1);font-weight:600;
+      text-transform:uppercase;letter-spacing:.04em}
+    .stat .n{font-size:28px;font-weight:700} .stat .l{color:var(--fg-2);font-size:12px}
+    .muted{color:var(--fg-2)} .mono{font-family:var(--mono);font-size:12px}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .between{display:flex;justify-content:space-between;align-items:center;gap:12px}
+    h3.sec{font-size:15px;margin:24px 0 12px}
+    /* ── pills ── */
+    .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
+    .p-active,.p-completed{background:var(--success-bg);color:var(--success)}
+    .p-running,.p-aggregated,.p-staged{background:var(--warn-bg);color:var(--warn)}
+    .p-blocked,.p-revoked,.p-archived{background:var(--danger-bg);color:var(--danger)}
+    .p-role{background:var(--accent-bg);color:#cfe0ff}
+    /* ── tables ── */
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th{text-align:left;color:var(--fg-2);font-weight:600;font-size:11px;text-transform:uppercase;
+      letter-spacing:.04em;padding:8px 10px;border-bottom:1px solid var(--border)}
+    td{padding:9px 10px;border-bottom:1px solid var(--border)}
+    tr:hover td{background:var(--bg-1)}
+    .tabnum{font-variant-numeric:tabular-nums}
+    /* ── buttons ── */
+    .btn{display:inline-flex;align-items:center;gap:6px;padding:7px 13px;border-radius:8px;
+      border:1px solid var(--border-2);background:var(--bg-2);color:var(--fg-0);
+      font:inherit;font-weight:600;font-size:13px;cursor:pointer}
+    .btn:hover{background:var(--bg-3)} .btn:disabled{opacity:.5;cursor:not-allowed}
+    .btn i{width:15px;height:15px}
+    .btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+    .btn-primary:hover{filter:brightness(1.08)}
+    .btn-danger{background:var(--danger-bg);border-color:transparent;color:var(--danger)}
+    .btn-sm{padding:4px 9px;font-size:12px}
+    /* ── forms ── */
+    label.f{display:block;font-size:12px;color:var(--fg-1);margin:0 0 5px;font-weight:600}
+    .input,textarea.input,select.input{width:100%;padding:9px 11px;background:var(--bg-0);
+      border:1px solid var(--border-2);border-radius:8px;color:var(--fg-0);font:inherit}
+    textarea.input{font-family:var(--mono);font-size:12px;resize:vertical}
+    .field{margin-bottom:12px}
+    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .empty{text-align:center;color:var(--fg-2);padding:34px}
+    /* ── toast ── */
+    .toasts{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:50}
+    .toast{padding:11px 15px;border-radius:9px;border:1px solid var(--border-2);
+      background:var(--bg-2);box-shadow:0 8px 28px rgba(0,0,0,.45);font-size:13px;max-width:380px}
+    .toast.ok{border-left:3px solid var(--success)} .toast.error{border-left:3px solid var(--danger)}
+    pre.json{background:var(--bg-0);border:1px solid var(--border);border-radius:8px;
+      padding:12px;overflow:auto;max-height:340px;font-family:var(--mono);font-size:12px}
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <div class="brand">
+        <span class="dot"></span>
+        <div>FL Coordinator<small>federation console</small></div>
+      </div>
+      <nav class="nav">
+        <a href="/dashboard"        class="{{ 'on' if active=='home' else '' }}"><i data-lucide="layout-dashboard"></i> Overview</a>
+        <a href="/dashboard/orgs"   class="{{ 'on' if active=='orgs' else '' }}"><i data-lucide="building-2"></i> Organizations</a>
+        <a href="/dashboard/rounds" class="{{ 'on' if active=='rounds' else '' }}"><i data-lucide="git-merge"></i> Rounds</a>
+        <a href="/dashboard/models" class="{{ 'on' if active=='models' else '' }}"><i data-lucide="boxes"></i> Global models</a>
+        <a href="/dashboard/audit"  class="{{ 'on' if active=='audit' else '' }}"><i data-lucide="scroll-text"></i> Audit trail</a>
+      </nav>
+      <div class="spacer"></div>
+      <form method="post" action="/logout"><button class="btn" style="width:100%"><i data-lucide="log-out"></i> Sign out</button></form>
+    </aside>
+    <div class="main">
+      <header class="top">
+        <h1>{% block heading %}{% endblock %}</h1>
+        <div class="who">
+          <span>{{ user.username }}</span>
+          <span class="pill p-role">{{ user.role }}</span>
+        </div>
+      </header>
+      <div class="inner">{% block content %}{% endblock %}</div>
+    </div>
+  </div>
+
+  <div class="toasts" x-data x-init="window._toasts=$el"></div>
+  <script>
+    // ── shared helpers: same-origin fetch (cookie auth) + toast + time ──
+    function toast(msg, kind='ok'){
+      const host=window._toasts; if(!host) return;
+      const el=document.createElement('div'); el.className='toast '+kind; el.textContent=msg;
+      host.appendChild(el); setTimeout(()=>el.remove(), 5200);
+    }
+    async function api(method, path, body){
+      const opt={method, credentials:'same-origin', headers:{}};
+      if(body!==undefined){opt.headers['Content-Type']='application/json'; opt.body=JSON.stringify(body);}
+      const r=await fetch(path, opt);
+      let data=null; try{ data=await r.json(); }catch(e){}
+      if(!r.ok){ const m=(data&&(data.detail||data.error))||('HTTP '+r.status); throw new Error(typeof m==='string'?m:JSON.stringify(m)); }
+      return data;
+    }
+    const apiGet=(p)=>api('GET',p);
+    const apiPost=(p,b)=>api('POST',p,b===undefined?{}:b);
+    const apiDel=(p)=>api('DELETE',p);
+    function ago(ts){ if(!ts) return '—'; const s=Math.max(0,(Date.now()/1000)-ts);
+      if(s<60)return Math.floor(s)+'s ago'; if(s<3600)return Math.floor(s/60)+'m ago';
+      if(s<86400)return Math.floor(s/3600)+'h ago'; return Math.floor(s/86400)+'d ago'; }
+    function dt(ts){ return ts? new Date(ts*1000).toISOString().slice(0,19).replace('T',' '):'—'; }
+    window.addEventListener('load',()=>{ if(window.lucide) lucide.createIcons(); });
+    document.addEventListener('alpine:initialized',()=>{ if(window.lucide) lucide.createIcons(); });
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>
