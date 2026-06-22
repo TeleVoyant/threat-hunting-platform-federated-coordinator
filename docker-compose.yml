@@ -24,15 +24,25 @@ services:
     read_only: true
     ports:
       - "8889:8889"          # REST + mTLS matrix-exchange API
+    # --ssl-cert-reqs 1 (CERT_OPTIONAL): the TLS layer accepts connections
+    # without a client cert, so the operator dashboard/API works from a browser;
+    # org /fl/* endpoints still REQUIRE a valid client cert, enforced at the app
+    # layer by FL_REQUIRE_MTLS=1 below. Using 2 (CERT_REQUIRED) would reject
+    # every certless connection at the handshake -- including the operator's own
+    # browser -- a bootstrap chicken-and-egg.
     command: >
       python -m uvicorn coordinator.app:app
       --host 0.0.0.0 --port 8889
       --ssl-certfile /app/data/ca/coordinator_cert.pem
       --ssl-keyfile  /app/data/ca/coordinator_key.pem
       --ssl-ca-certs /app/data/ca/ca_cert.pem
-      --ssl-cert-reqs 2
+      --ssl-cert-reqs 1
     environment:
       - FL_DATA_DIR=/app/data
+      # Require a verified mTLS client cert for org /fl/* endpoints at the app
+      # layer (refuses the X-FL-API-Key bootstrap fallback for orgs). Operators
+      # still authenticate by API key. Pairs with --ssl-cert-reqs 1 above.
+      - FL_REQUIRE_MTLS=1
       - FL_CA_DIR=/app/data/ca
       - FL_MODEL_DIR=/app/data/models
       - FL_USERS_FILE=/app/config/fl_users.yml
