@@ -38,13 +38,15 @@ from fastapi.security import APIKeyHeader, HTTPBearer
 from pydantic import BaseModel, Field
 
 from flproto.attestation import (
-    build_global_model_attestation, build_round_announcement_attestation,
+    build_global_model_attestation, build_removal_confirm_attestation,
+    build_round_announcement_attestation,
     build_trust_notification_attestation, generate_challenge,
     public_key_from_pem, public_key_to_pem, sign as att_sign, verify as att_verify,
 )
 from flproto.ca import (
-    cert_to_pem, issue_client_cert,
+    build_crl, cert_to_pem, issue_client_cert, CRL_FILE,
 )
+from cryptography.hazmat.primitives import serialization
 from coordinator.aggregation import (
     describe_schema, merge_xgboost_models, model_feature_schema,
 )
@@ -133,6 +135,22 @@ def _store(request: Request):
 
 def _audit(request: Request):
     return request.app.state.fl_audit_trail
+
+
+def _regenerate_crl(request: Request) -> None:
+    """Rebuild + persist the CRL from every revoked org's cert serial, then
+    hot-reload it into app.state so mtls_middleware revocation checks see it
+    immediately. No-op when the CA isn't initialised."""
+    ca_priv = getattr(request.app.state, "fl_ca_priv", None)
+    ca_cert = getattr(request.app.state, "fl_ca_cert", None)
+    if ca_priv is None or ca_cert is None:
+        return
+    serials = _store(request).list_revoked_serials()
+    crl = build_crl(ca_priv, ca_cert, revoked_serials=serials)
+    ca_dir = _os.environ.get("FL_CA_DIR", "data/ca")
+    from pathlib import Path as _Path
+    (_Path(ca_dir) / CRL_FILE).write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+    request.app.state.fl_crl = crl
 
 
 # ── Org authentication (mTLS preferred; API key fallback for bootstrap/test) ─
@@ -368,8 +386,131 @@ async def revoke_org(
     if not store.get_org(org_id):
         raise HTTPException(404, f"Unknown org: {org_id}")
     store.set_org_status(org_id, "revoked")
+    _regenerate_crl(request)
     _audit(request).log("fl.org.revoke", user.username, org_id, {})
     return {"org_id": org_id, "status": "revoked"}
+
+
+# ── Mutual-ack org removal (org self-removal handshake) ─────────────────────
+
+class LeaveRequestBody(BaseModel):
+    attestation: str = Field(..., description="canonical-JSON bytes (utf-8) of the org-signed fl.leave_request.v1")
+    signature:   str = Field(..., description="hex Ed25519 signature over attestation")
+
+
+@router.post("/orgs/{org_id}/leave-request")
+async def org_leave_request(
+    org_id: str,
+    body: LeaveRequestBody,
+    request: Request,
+    auth_org_id: str = Depends(get_authenticated_org_id),
+):
+    """Org-initiated half of the mutual-ack removal. The org submits a SIGNED
+    fl.leave_request.v1; the coordinator verifies it against the org's public
+    key, moves the org to 'leave_pending' (no longer invited to rounds), and
+    stores the signed request. Completion still requires operator approval."""
+    store = _store(request)
+    if auth_org_id != org_id:
+        raise HTTPException(403, "authenticated org does not match path org_id")
+    org = store.get_org(org_id)
+    if not org:
+        raise HTTPException(404, f"Unknown org: {org_id}")
+    if org["status"] == "revoked":
+        raise HTTPException(409, "org already removed")
+    att_bytes = body.attestation.encode("utf-8")
+    import json as _json
+    try:
+        att = _json.loads(att_bytes)
+    except Exception:
+        raise HTTPException(400, "attestation is not valid JSON")
+    if att.get("type") != "fl.leave_request.v1" or att.get("org_id") != org_id:
+        raise HTTPException(400, "attestation type/org_id mismatch")
+    pub_pem = org.get("public_key_pem")
+    if not pub_pem:
+        raise HTTPException(403, "Org has no public key registered")
+    try:
+        sig_bytes = bytes.fromhex(body.signature)
+    except ValueError:
+        raise HTTPException(400, "signature must be hex-encoded")
+    if not att_verify(public_key_from_pem(pub_pem.encode()), att_bytes, sig_bytes):
+        raise HTTPException(403, "leave-request signature verification failed")
+    store.set_leave_request(org_id, att_bytes, body.signature)
+    _audit(request).log(
+        action="fl.org.leave_requested", actor=f"org:{org_id}", target=org_id,
+        details={"reason": str(att.get("reason", ""))[:200]},
+    )
+    return {"org_id": org_id, "status": "leave_pending",
+            "note": "awaiting operator approval (POST /fl/orgs/{org_id}/approve-removal)"}
+
+
+@router.post("/orgs/{org_id}/approve-removal")
+async def approve_removal(
+    org_id: str,
+    request: Request,
+    user: FLUser = Depends(fl_require("fl_revoke_org")),
+):
+    """Operator half of the mutual-ack removal: ONLY valid when the org has a
+    pending leave request (status 'leave_pending'). Revokes the org, regenerates
+    the CRL, and emits a coordinator-SIGNED fl.removal_confirm.v1 the org
+    verifies before wiping locally. Force-removing a non-requesting org uses
+    DELETE /orgs/{id} instead."""
+    store = _store(request)
+    org = store.get_org(org_id)
+    if not org:
+        raise HTTPException(404, f"Unknown org: {org_id}")
+    if org["status"] != "leave_pending":
+        raise HTTPException(
+            409,
+            f"org has not requested to leave (status={org['status']}). "
+            f"Use DELETE /fl/orgs/{org_id} to force-revoke.",
+        )
+    coord_priv = getattr(request.app.state, "fl_coord_priv", None)
+    if coord_priv is None:
+        raise HTTPException(503, "Coordinator signing key not loaded")
+    store.set_org_status(org_id, "revoked")
+    _regenerate_crl(request)
+    confirm_bytes = build_removal_confirm_attestation(org_id=org_id)
+    sig_hex = att_sign(coord_priv, confirm_bytes).hex()
+    store.set_removal_confirm(org_id, confirm_bytes, sig_hex)
+    _audit(request).log(
+        action="fl.org.removal_approved", actor=user.username, target=org_id, details={},
+    )
+    return {
+        "org_id": org_id, "status": "revoked",
+        "removal_confirm": {"signed_attestation": confirm_bytes.decode("utf-8"),
+                            "signature_hex": sig_hex},
+    }
+
+
+@router.get("/orgs/{org_id}/removal-status")
+async def removal_status(
+    org_id: str,
+    request: Request,
+    api_key = Depends(_api_key),
+):
+    """Org polls this to learn whether its removal was approved and to fetch the
+    coordinator-signed confirmation. Auth is relaxed so a leave_pending OR
+    revoked org can read its OWN status (standard org-auth requires 'active',
+    which a just-revoked org no longer is). Read-only, own org only."""
+    store = _store(request)
+    org = store.get_org(org_id)
+    if not org:
+        raise HTTPException(404, f"Unknown org: {org_id}")
+    auth_ok = getattr(request.state, "mtls_org_id", None) == org_id
+    if not auth_ok and api_key:
+        import hmac as _hmac
+        h = hashlib.sha256(api_key.encode()).hexdigest()
+        auth_ok = _hmac.compare_digest(org["api_key_hash"], h)
+    if not auth_ok:
+        raise HTTPException(401, "auth required (mTLS client cert or X-FL-API-Key for this org)")
+    resp = {"org_id": org_id, "status": org["status"]}
+    ra = org.get("removal_attestation")
+    if org["status"] == "revoked" and ra:
+        resp["removal_confirm"] = {
+            "signed_attestation": ra.decode("utf-8") if isinstance(ra, (bytes, bytearray)) else ra,
+            "signature_hex": org.get("removal_signature"),
+        }
+    return resp
 
 
 # ── Rounds ─────────────────────────────────────────────────────────────────

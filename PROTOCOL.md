@@ -66,6 +66,28 @@ Signed per-org trust change, returned by `/aggregate`; orgs keep these as proof.
   "trust_score":<float>, "reason":"<str>", "issued_at":"<ISO-8601 UTC>" }
 ```
 
+### 5. `fl.leave_request.v1`  (org → coordinator)
+Signed by the **org** to request removal from the federation (mutual-ack
+handshake, step 1). POSTed to `/fl/orgs/{id}/leave-request`; the coordinator
+verifies it against the org's registered public key (so no third party can forge
+a leave for another org) and moves the org to `leave_pending` — it is no longer
+invited to rounds, but removal is not final until an operator approves.
+```json
+{ "type":"fl.leave_request.v1", "org_id":"<str>", "reason":"<str>",
+  "requested_at":"<ISO-8601 UTC>" }
+```
+
+### 6. `fl.removal_confirm.v1`  (coordinator → org)
+Signed by the **coordinator** when an operator APPROVES a pending leave
+(`POST /fl/orgs/{id}/approve-removal`, step 2 — valid only from `leave_pending`).
+The org fetches it from `GET /fl/orgs/{id}/removal-status` and **verifies it
+before wiping its local credentials**. Approval also sets the org `revoked` and
+regenerates the CRL. (An operator may also `DELETE /fl/orgs/{id}` to force-revoke
+a non-requesting org; that emits no confirmation.)
+```json
+{ "type":"fl.removal_confirm.v1", "org_id":"<str>", "revoked_at":"<ISO-8601 UTC>" }
+```
+
 ## Contribution flow (the core exchange)
 
 ```

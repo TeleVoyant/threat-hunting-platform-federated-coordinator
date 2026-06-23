@@ -203,6 +203,46 @@ def build_trust_notification_attestation(
     return canonical_json(payload)
 
 
+def build_leave_request_attestation(
+    *,
+    org_id: str,
+    reason: Optional[str] = None,
+    requested_at: Optional[str] = None,
+) -> bytes:
+    """
+    Org -> Coordinator: signed when an org requests to LEAVE the federation.
+    The coordinator verifies this against the org's registered public key, so
+    no third party can forge a leave request for another org (non-repudiation).
+    Half of the mutual-ack removal handshake.
+    """
+    payload = {
+        "type":         "fl.leave_request.v1",
+        "org_id":       str(org_id),
+        "reason":       str(reason or ""),
+        "requested_at": requested_at or datetime.now(timezone.utc).isoformat(),
+    }
+    return canonical_json(payload)
+
+
+def build_removal_confirm_attestation(
+    *,
+    org_id: str,
+    revoked_at: Optional[str] = None,
+) -> bytes:
+    """
+    Coordinator -> Org: signed when the operator APPROVES an org's removal. The
+    org verifies this against the coordinator's public key before wiping its
+    local credentials, so it only tears down on a genuine, authorised removal.
+    The other half of the mutual-ack removal handshake.
+    """
+    payload = {
+        "type":       "fl.removal_confirm.v1",
+        "org_id":     str(org_id),
+        "revoked_at": revoked_at or datetime.now(timezone.utc).isoformat(),
+    }
+    return canonical_json(payload)
+
+
 # ── Challenge tokens ────────────────────────────────────────────────────────
 
 def generate_challenge() -> str:

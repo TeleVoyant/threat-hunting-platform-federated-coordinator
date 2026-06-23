@@ -58,6 +58,7 @@
               <button x-show="o.status==='blocked'" class="btn btn-sm" @click="act('unblock',o)">Unblock</button>
               {% endif %}
               {% if perms.fl_revoke_org %}
+              <button x-show="o.status==='leave_pending'" class="btn btn-sm btn-primary" @click="approveRemoval(o)">Approve removal</button>
               <button x-show="o.status!=='revoked'" class="btn btn-sm btn-danger" @click="revoke(o)">Revoke</button>
               {% endif %}
             </td>
@@ -90,7 +91,12 @@ function orgsPage(){
     },
     async act(kind,o){ try{ await apiPost('/fl/orgs/'+o.org_id+'/'+kind); toast(o.org_id+' '+kind+'ed','ok'); await this.load(); }
       catch(e){ toast(e.message,'error') } },
-    async revoke(o){ if(!confirm('Permanently revoke '+o.org_id+'? Its api_key + cert become invalid.'))return;
+    async approveRemoval(o){
+      if(prompt('Approve removal of "'+o.org_id+'"? Type the org_id to confirm:')!==o.org_id){ toast('cancelled','warn'); return; }
+      try{ await apiPost('/fl/orgs/'+o.org_id+'/approve-removal'); toast(o.org_id+' removed (mutual ack)','ok'); await this.load(); }
+      catch(e){ toast(e.message,'error') } },
+    async revoke(o){
+      if(prompt('FORCE-revoke "'+o.org_id+'" WITHOUT org consent? Type the org_id to confirm:')!==o.org_id){ toast('cancelled','warn'); return; }
       try{ await apiDel('/fl/orgs/'+o.org_id); toast(o.org_id+' revoked','ok'); await this.load(); }
       catch(e){ toast(e.message,'error') } },
     copyPkg(){ navigator.clipboard.writeText(JSON.stringify(this.pkg,null,2)); toast('Copied','ok'); },

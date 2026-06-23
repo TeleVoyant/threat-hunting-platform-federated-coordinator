@@ -34,7 +34,12 @@ CREATE TABLE IF NOT EXISTS orgs (
     trust_score      REAL NOT NULL DEFAULT 1.0,
     last_seen_at     REAL,
     last_accuracy    REAL,                             -- last validation accuracy (poisoning sudden-drop baseline; persisted so it survives restarts)
-    notes            TEXT
+    notes            TEXT,
+    leave_requested_at  REAL,                          -- mutual-ack removal: when the org requested to leave
+    leave_attestation   BLOB,                          -- org-signed fl.leave_request.v1 (non-repudiation)
+    leave_signature     TEXT,                          -- hex Ed25519 sig over leave_attestation
+    removal_attestation BLOB,                          -- coordinator-signed fl.removal_confirm.v1
+    removal_signature   TEXT                           -- hex sig over removal_attestation
 );
 
 CREATE TABLE IF NOT EXISTS rounds (
@@ -136,6 +141,14 @@ class CoordinatorStore:
             self.conn.execute("ALTER TABLE rounds ADD COLUMN announce_attestation BLOB")
         if "announce_signature" not in rcols:
             self.conn.execute("ALTER TABLE rounds ADD COLUMN announce_signature TEXT")
+        # Mutual-ack org removal columns (added later than the original orgs table).
+        for _col, _type in (
+            ("leave_requested_at", "REAL"), ("leave_attestation", "BLOB"),
+            ("leave_signature", "TEXT"), ("removal_attestation", "BLOB"),
+            ("removal_signature", "TEXT"),
+        ):
+            if _col not in ocols:
+                self.conn.execute(f"ALTER TABLE orgs ADD COLUMN {_col} {_type}")
         self.conn.commit()
         self._lock = Lock()
 
@@ -364,12 +377,36 @@ class CoordinatorStore:
         return dict(row)
 
     def set_org_status(self, org_id: str, status: str) -> None:
-        if status not in {"active", "blocked", "revoked"}:
+        if status not in {"active", "blocked", "revoked", "leave_pending"}:
             raise ValueError(f"Invalid status: {status}")
         with self._lock:
             self.conn.execute(
                 "UPDATE orgs SET status = ? WHERE org_id = ?",
                 (status, org_id),
+            )
+            self.conn.commit()
+
+    def set_leave_request(self, org_id: str, attestation: bytes, signature_hex: str) -> None:
+        """Org requested to leave: store the org-signed fl.leave_request.v1
+        (non-repudiation) and move the org to 'leave_pending' so it stops being
+        invited to rounds while the operator decides. Half of the mutual ack."""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE orgs SET status = 'leave_pending', leave_requested_at = ?, "
+                "leave_attestation = ?, leave_signature = ? WHERE org_id = ?",
+                (time.time(), attestation, signature_hex, org_id),
+            )
+            self.conn.commit()
+
+    def set_removal_confirm(self, org_id: str, attestation: bytes, signature_hex: str) -> None:
+        """Operator approved removal: store the coordinator-signed
+        fl.removal_confirm.v1 so the org can fetch + verify it (via
+        GET /orgs/{id}/removal-status) before wiping its local credentials."""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE orgs SET removal_attestation = ?, removal_signature = ? "
+                "WHERE org_id = ?",
+                (attestation, signature_hex, org_id),
             )
             self.conn.commit()
 
