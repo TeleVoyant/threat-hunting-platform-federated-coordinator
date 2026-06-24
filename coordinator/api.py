@@ -38,6 +38,7 @@ from fastapi.security import APIKeyHeader, HTTPBearer
 from pydantic import BaseModel, Field
 
 from flproto.attestation import (
+    build_enroll_pop, build_enroll_token_attestation,
     build_global_model_attestation, build_removal_confirm_attestation,
     build_round_announcement_attestation,
     build_trust_notification_attestation, generate_challenge,
@@ -46,6 +47,7 @@ from flproto.attestation import (
 from flproto.ca import (
     build_crl, cert_to_pem, issue_client_cert, CRL_FILE,
 )
+from flproto.seal_box import seal as seal_package, x25519_public_from_pem
 from cryptography.hazmat.primitives import serialization
 from coordinator.aggregation import (
     describe_schema, merge_xgboost_models, model_feature_schema,
@@ -337,6 +339,142 @@ async def enroll_org(
                                 "and is intended for bootstrap only — switch to "
                                 "mTLS for all subsequent calls.",
     }
+
+
+# ── Token-based self-enrollment (org submits its own keys; no operator round-trip) ─
+
+class EnrollTokenRequest(BaseModel):
+    org_id:       str = Field(..., min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    display_name: str = Field(..., min_length=1, max_length=128)
+    ttl_minutes:  int = Field(60, ge=1, le=1440, description="Token lifetime (default 60m, max 24h)")
+
+
+@router.post("/orgs/enroll-token", status_code=201)
+async def mint_enroll_token(
+    body: EnrollTokenRequest,
+    request: Request,
+    user: FLUser = Depends(fl_require("fl_enroll_org")),
+):
+    """Mint a single-use, short-TTL self-enrollment token bound to an org_id.
+    Give the org BOTH the token and the returned `ca_sha256` fingerprint (the org
+    verifies the unsealed CA cert against it to defeat a rogue-CA MITM). The
+    org_id must not already be actively enrolled."""
+    import base64, secrets, hashlib as _hl
+    store = _store(request)
+    existing = store.get_org(body.org_id)
+    if existing and existing["status"] != "revoked":
+        raise HTTPException(409, f"org_id already enrolled (status={existing['status']}); "
+                                 f"revoke it first to re-issue")
+    coord_priv = getattr(request.app.state, "fl_coord_priv", None)
+    ca_cert = getattr(request.app.state, "fl_ca_cert", None)
+    if coord_priv is None or ca_cert is None:
+        raise HTTPException(503, "Coordinator signing key / CA not loaded")
+    jti = secrets.token_urlsafe(16)
+    expires_at = time.time() + body.ttl_minutes * 60
+    token_att = build_enroll_token_attestation(
+        org_id=body.org_id, display_name=body.display_name, jti=jti, expires_at=expires_at)
+    token = base64.urlsafe_b64encode(
+        token_att + b"." + att_sign(coord_priv, token_att).hex().encode()).decode()
+    store.create_enroll_token(jti, body.org_id, body.display_name, expires_at)
+    ca_sha256 = _hl.sha256(cert_to_pem(ca_cert)).hexdigest()
+    _audit(request).log(action="fl.org.enroll_token", actor=user.username,
+                        target=body.org_id, details={"jti": jti, "ttl_minutes": body.ttl_minutes})
+    return {"token": token, "org_id": body.org_id, "ca_sha256": ca_sha256,
+            "expires_at": expires_at,
+            "instructions": "Give the org BOTH the token and ca_sha256. They self-enroll via "
+                            "POST /fl/local/enroll (coordinator_url + token + expected_ca_sha256)."}
+
+
+class EnrollWithTokenRequest(BaseModel):
+    token:           str = Field(..., min_length=8)
+    org_id:          str = Field(..., min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    ed25519_pub_pem: str = Field(..., min_length=20)
+    x25519_pub_pem:  str = Field(..., min_length=20)
+    pop_signature:   str = Field(..., min_length=16, description="hex Ed25519 sig over build_enroll_pop")
+
+
+@router.post("/orgs/enroll-with-token", status_code=201)
+async def enroll_with_token(
+    body: EnrollWithTokenRequest,
+    request: Request,
+):
+    """Self-enrollment: NO operator auth — the coordinator-signed token IS the
+    authorization. Verifies token (sig + TTL + single-use jti) + PoP (the org
+    controls the Ed25519 key), issues a CA-signed client cert + api_key, and
+    returns the enrollment package SEALED to the org's X25519 key."""
+    import base64, json as _json
+    store = _store(request)
+    coord_priv = getattr(request.app.state, "fl_coord_priv", None)
+    ca_priv = getattr(request.app.state, "fl_ca_priv", None)
+    ca_cert = getattr(request.app.state, "fl_ca_cert", None)
+    if coord_priv is None or ca_priv is None or ca_cert is None:
+        raise HTTPException(503, "Coordinator keys / CA not loaded")
+
+    # 1. Decode + verify the token (coordinator signature)
+    try:
+        raw = base64.urlsafe_b64decode(body.token.encode())
+        att_bytes, sig_hex = raw.rsplit(b".", 1)
+        token_sig = bytes.fromhex(sig_hex.decode())
+    except Exception:
+        raise HTTPException(400, "Malformed enrollment token")
+    if not att_verify(coord_priv.public_key(), att_bytes, token_sig):
+        raise HTTPException(403, "Enrollment token signature invalid")
+    try:
+        tok = _json.loads(att_bytes)
+    except Exception:
+        raise HTTPException(400, "Malformed token payload")
+    if tok.get("type") != "fl.enroll_token.v1" or tok.get("org_id") != body.org_id:
+        raise HTTPException(400, "Token type/org_id mismatch")
+
+    # 2. Verify proof-of-possession (org controls the Ed25519 key) + X25519 parses.
+    #    Done BEFORE consuming the token so a bad PoP can't burn the single-use jti.
+    try:
+        ed_pub = public_key_from_pem(body.ed25519_pub_pem.encode())
+    except Exception as e:
+        raise HTTPException(400, f"Invalid ed25519_pub_pem: {e}")
+    try:
+        x25519_public_from_pem(body.x25519_pub_pem.encode())
+    except Exception as e:
+        raise HTTPException(400, f"Invalid x25519_pub_pem: {e}")
+    pop_att = build_enroll_pop(token_b64=body.token, x25519_pub_pem=body.x25519_pub_pem)
+    try:
+        pop_sig = bytes.fromhex(body.pop_signature)
+    except ValueError:
+        raise HTTPException(400, "pop_signature must be hex")
+    if not att_verify(ed_pub, pop_att, pop_sig):
+        raise HTTPException(403, "Proof-of-possession signature invalid")
+
+    # 3. Consume the jti (atomic single-use + TTL) — only after PoP succeeds
+    err = store.consume_enroll_token(tok["jti"], body.org_id)
+    if err:
+        raise HTTPException(403, f"Enrollment token rejected: {err}")
+
+    # 4. Issue cert + api_key + enroll
+    client_cert = issue_client_cert(ca_priv=ca_priv, ca_cert=ca_cert, client_pub=ed_pub,
+                                    org_id=body.org_id, display_name=tok["display_name"])
+    client_cert_pem = cert_to_pem(client_cert).decode()
+    cert_serial = str(client_cert.serial_number)
+    api_key, api_key_hash = generate_fl_api_key()
+    try:
+        store.enroll_org(org_id=body.org_id, display_name=tok["display_name"],
+                         api_key_hash=api_key_hash, enrolled_by=f"self:token:{tok['jti']}",
+                         public_key_pem=body.ed25519_pub_pem, cert_pem=client_cert_pem,
+                         cert_serial=cert_serial)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+    # 5. Build + SEAL the package to the org's X25519 key
+    package = {
+        "org_id": body.org_id, "api_key": api_key,
+        "client_cert_pem": client_cert_pem,
+        "ca_cert_pem": cert_to_pem(ca_cert).decode(),
+        "coordinator_pub_pem": public_key_to_pem(coord_priv.public_key()).decode(),
+        "cert_serial": cert_serial,
+    }
+    sealed = seal_package(body.x25519_pub_pem, _json.dumps(package).encode())
+    _audit(request).log(action="fl.org.self_enrolled", actor=f"org:{body.org_id}",
+                        target=body.org_id, details={"jti": tok["jti"], "cert_serial": cert_serial})
+    return {"org_id": body.org_id, "sealed_package_b64": sealed}
 
 
 @router.get("/orgs")

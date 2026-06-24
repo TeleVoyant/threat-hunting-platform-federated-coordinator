@@ -88,6 +88,49 @@ a non-requesting org; that emits no confirmation.)
 { "type":"fl.removal_confirm.v1", "org_id":"<str>", "revoked_at":"<ISO-8601 UTC>" }
 ```
 
+### 7. `fl.enroll_token.v1`  (coordinator → org, redeemed)
+Signed by the **coordinator** when an operator pre-authorizes an org via
+`POST /fl/orgs/enroll-token`. Single-use (a `jti` tracked + atomically consumed)
+and short-TTL. The org receives it opaquely (wire form
+`base64(canonical_json || "." || sig_hex)`) plus the CA SHA-256 fingerprint, and
+redeems it at `POST /fl/orgs/enroll-with-token` to self-enroll.
+```json
+{ "type":"fl.enroll_token.v1", "org_id":"<str>", "display_name":"<str>",
+  "jti":"<str>", "expires_at":<float epoch> }
+```
+
+### 8. `fl.enroll_pop.v1`  (org → coordinator)
+Proof-of-possession the **org** signs with its Ed25519 key during self-enroll,
+binding (the token, the org's X25519 sealed-box key). The coordinator verifies it
+against the submitted Ed25519 pubkey before certifying that key — so a key the org
+doesn't control can't be enrolled, and the seal target can't be swapped.
+```json
+{ "type":"fl.enroll_pop.v1", "token_sha256":"<hex>", "x25519_pub_pem":"<PEM>" }
+```
+
+## Secure self-enrollment flow
+```
+operator                         coordinator                         org
+  │ POST /fl/orgs/enroll-token ─────▶ mint signed fl.enroll_token.v1
+  │ ◀── { token, ca_sha256, expires_at }
+  │ ── (token + ca_sha256, out-of-band) ──────────────────────────────▶ │
+  │                                                                      │ gen Ed25519 + X25519
+  │                              POST /fl/orgs/enroll-with-token  ◀────── │ sign fl.enroll_pop.v1
+  │                              verify token sig + PoP, consume jti      │
+  │                              issue CA cert + api_key                  │
+  │                              SEAL package to org X25519 ──────────────▶ unseal (X25519)
+  │                                                                      │ check sha256(ca)==ca_sha256
+  │                                                                      │ configure  ✓
+```
+**Sealed package** = `base64( ephemeral_X25519_pub(32) || ChaCha20Poly1305_ct )`,
+key = `HKDF-SHA256(ECDH(eph, org_X25519), salt=eph_pub||org_pub, info="fl.enroll.seal.v1")`
+(libsodium `crypto_box_seal` equivalent; the org's X25519 key is the only one that
+opens it). Authenticity of the coordinator comes from the **out-of-band CA
+fingerprint** the org checks against the unsealed CA cert (defeats a rogue-CA MITM);
+confidentiality from the seal. The token is the only transmitted bearer secret —
+single-use + short-TTL, and a theft is detectable (the org's later redeem 403s on
+the consumed `jti`).
+
 ## Contribution flow (the core exchange)
 
 ```

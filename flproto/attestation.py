@@ -243,6 +243,45 @@ def build_removal_confirm_attestation(
     return canonical_json(payload)
 
 
+def build_enroll_token_attestation(
+    *,
+    org_id: str,
+    display_name: str,
+    jti: str,
+    expires_at: float,
+) -> bytes:
+    """
+    Coordinator -> Org: a single-use, short-TTL enrollment token. Signed by the
+    coordinator; the org presents it (with its freshly-generated keys + a PoP) to
+    POST /fl/orgs/enroll-with-token to self-enroll without the operator handling
+    the org's public key.
+    """
+    payload = {
+        "type":         "fl.enroll_token.v1",
+        "org_id":       str(org_id),
+        "display_name": str(display_name),
+        "jti":          str(jti),
+        "expires_at":   round(float(expires_at), 3),
+    }
+    return canonical_json(payload)
+
+
+def build_enroll_pop(*, token_b64: str, x25519_pub_pem: str) -> bytes:
+    """
+    Org -> Coordinator: the proof-of-possession challenge the org signs with its
+    Ed25519 private key during self-enrollment. Binds the enrollment to (the
+    token, the org's X25519 sealed-box key) so the coordinator can verify the
+    submitter controls the Ed25519 key it is about to certify, and that the
+    X25519 key it seals the package to wasn't swapped.
+    """
+    payload = {
+        "type":           "fl.enroll_pop.v1",
+        "token_sha256":   hashlib.sha256(token_b64.encode("ascii")).hexdigest(),
+        "x25519_pub_pem": str(x25519_pub_pem),
+    }
+    return canonical_json(payload)
+
+
 # ── Challenge tokens ────────────────────────────────────────────────────────
 
 def generate_challenge() -> str:

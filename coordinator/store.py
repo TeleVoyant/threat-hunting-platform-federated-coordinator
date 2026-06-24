@@ -73,6 +73,19 @@ CREATE TABLE IF NOT EXISTS challenges (
     FOREIGN KEY(org_id) REFERENCES orgs(org_id)
 );
 
+-- Single-use, short-TTL self-enrollment tokens. The operator pre-authorizes an
+-- org_id; the org redeems the token (with its own keys + a PoP) at
+-- /fl/orgs/enroll-with-token. Consumed atomically to prevent double-redemption.
+CREATE TABLE IF NOT EXISTS enrollment_tokens (
+    jti           TEXT PRIMARY KEY,
+    org_id        TEXT NOT NULL,
+    display_name  TEXT NOT NULL,
+    issued_at     REAL NOT NULL,
+    expires_at    REAL NOT NULL,
+    consumed      INTEGER NOT NULL DEFAULT 0,
+    consumed_at   REAL
+);
+
 -- Permanent record of every accepted+verified contribution.
 -- The signed_attestation column is the BYTES that were signed — this is
 -- the non-repudiable artefact. Anyone with the org's public key can
@@ -273,6 +286,48 @@ class CoordinatorStore:
             if row["expires_at"] <= now:
                 return "Challenge expired"
             return "Challenge consumption failed"
+
+    # ── Self-enrollment tokens (single-use bootstrap) ────────────────────────
+
+    def create_enroll_token(
+        self, jti: str, org_id: str, display_name: str, expires_at: float,
+    ) -> None:
+        """Persist a freshly-minted enrollment token as pending."""
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO enrollment_tokens(jti, org_id, display_name, "
+                "issued_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                (jti, org_id, display_name, time.time(), expires_at),
+            )
+            self.conn.commit()
+
+    def consume_enroll_token(self, jti: str, org_id: str) -> Optional[str]:
+        """Atomically validate + consume an enrollment token. Returns None on
+        success, an error string on failure. The single UPDATE makes redemption
+        single-use even under concurrent attempts."""
+        now = time.time()
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE enrollment_tokens SET consumed = 1, consumed_at = ? "
+                "WHERE jti = ? AND org_id = ? AND consumed = 0 AND expires_at > ?",
+                (now, jti, org_id, now),
+            )
+            self.conn.commit()
+            if cur.rowcount > 0:
+                return None
+            row = self.conn.execute(
+                "SELECT org_id, consumed, expires_at FROM enrollment_tokens WHERE jti = ?",
+                (jti,),
+            ).fetchone()
+            if not row:
+                return "Unknown enrollment token"
+            if row["org_id"] != org_id:
+                return "Token belongs to a different org"
+            if row["consumed"]:
+                return "Token already used"
+            if row["expires_at"] <= now:
+                return "Token expired"
+            return "Token rejected"
 
     # ── Contributions ──────────────────────────────────────────────────────
 

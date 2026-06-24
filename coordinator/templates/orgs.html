@@ -38,6 +38,39 @@
   </div>
   {% endif %}
 
+  {% if perms.fl_enroll_org %}
+  <div class="card" style="margin-bottom:16px">
+    <div class="between" style="cursor:pointer" @click="showToken=!showToken">
+      <h2 style="margin:0">Issue self-enrollment token (recommended)</h2>
+      <button class="btn btn-sm"><i :data-lucide="showToken?'chevron-up':'chevron-down'"></i></button>
+    </div>
+    <div x-show="showToken" x-cloak style="margin-top:14px">
+      <p class="muted" style="font-size:12px">The org self-enrolls with this token: it submits its own keys + a proof-of-possession and never sends you its public key. Give the org BOTH the token and the CA fingerprint (out-of-band).</p>
+      <div class="form-grid">
+        <div class="field"><label class="f">Org ID</label>
+          <input class="input" x-model="tform.org_id" placeholder="udom"></div>
+        <div class="field"><label class="f">Display name</label>
+          <input class="input" x-model="tform.display_name" placeholder="University of Dodoma"></div>
+        <div class="field"><label class="f">TTL (minutes)</label>
+          <input class="input" type="number" min="1" max="1440" x-model.number="tform.ttl_minutes"></div>
+      </div>
+      <button class="btn btn-primary" :disabled="busy||!tform.org_id||!tform.display_name" @click="mintToken()">
+        <i data-lucide="ticket"></i> Mint token</button>
+
+      <div x-show="tok" x-cloak style="margin-top:16px">
+        <div class="row" style="justify-content:space-between">
+          <h2 style="margin:0">Give the org the token + CA fingerprint</h2>
+          <button class="btn btn-sm" @click="copyTok()"><i data-lucide="copy"></i> Copy both</button>
+        </div>
+        <div class="field"><label class="f">Enrollment token (single-use, expires)</label>
+          <textarea class="input mono" rows="3" readonly x-text="tok && tok.token"></textarea></div>
+        <div class="field"><label class="f">Expected CA SHA-256 (the org verifies the coordinator against this)</label>
+          <input class="input mono" readonly :value="tok && tok.ca_sha256"></div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
   <div class="card">
     <div class="between"><h2 style="margin:0">Enrolled organizations</h2>
       <button class="btn btn-sm" @click="load()"><i data-lucide="refresh-cw"></i> Refresh</button></div>
@@ -74,8 +107,9 @@
 <script>
 function orgsPage(){
   return {
-    orgs:[], busy:false, showEnroll:false, pkg:null,
+    orgs:[], busy:false, showEnroll:false, pkg:null, showToken:false, tok:null,
     form:{org_id:'',display_name:'',public_key_pem:'',notes:''},
+    tform:{org_id:'',display_name:'',ttl_minutes:60},
     async load(){ try{ this.orgs=(await apiGet('/fl/orgs')).orgs||[] }catch(e){toast(e.message,'error')}
       this.$nextTick(()=>window.lucide&&lucide.createIcons()); },
     async enroll(){
@@ -99,6 +133,17 @@ function orgsPage(){
       if(prompt('FORCE-revoke "'+o.org_id+'" WITHOUT org consent? Type the org_id to confirm:')!==o.org_id){ toast('cancelled','warn'); return; }
       try{ await apiDel('/fl/orgs/'+o.org_id); toast(o.org_id+' revoked','ok'); await this.load(); }
       catch(e){ toast(e.message,'error') } },
+    async mintToken(){
+      this.busy=true; this.tok=null;
+      try{
+        this.tok=await apiPost('/fl/orgs/enroll-token',{
+          org_id:this.tform.org_id.trim(), display_name:this.tform.display_name.trim()||this.tform.org_id.trim(),
+          ttl_minutes:this.tform.ttl_minutes||60});
+        toast('Token minted for '+this.tform.org_id,'ok');
+      }catch(e){ toast('Mint failed: '+e.message,'error') } finally{ this.busy=false;
+        this.$nextTick(()=>window.lucide&&lucide.createIcons()); }
+    },
+    copyTok(){ navigator.clipboard.writeText('token: '+this.tok.token+'\nca_sha256: '+this.tok.ca_sha256); toast('Copied','ok'); },
     copyPkg(){ navigator.clipboard.writeText(JSON.stringify(this.pkg,null,2)); toast('Copied','ok'); },
   }
 }
