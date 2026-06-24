@@ -137,20 +137,29 @@ def _audit(request: Request):
     return request.app.state.fl_audit_trail
 
 
-def _regenerate_crl(request: Request) -> None:
+def _regenerate_crl(request: Request) -> bool:
     """Rebuild + persist the CRL from every revoked org's cert serial, then
     hot-reload it into app.state so mtls_middleware revocation checks see it
-    immediately. No-op when the CA isn't initialised."""
+    immediately. Best-effort defense-in-depth: a revoked org is authoritatively
+    blocked by its status!='active' check (both the api-key and mTLS paths), so a
+    CRL write failure is logged but never fails the caller. No-op when the CA
+    isn't initialised. Returns True on success."""
     ca_priv = getattr(request.app.state, "fl_ca_priv", None)
     ca_cert = getattr(request.app.state, "fl_ca_cert", None)
     if ca_priv is None or ca_cert is None:
-        return
-    serials = _store(request).list_revoked_serials()
-    crl = build_crl(ca_priv, ca_cert, revoked_serials=serials)
-    ca_dir = _os.environ.get("FL_CA_DIR", "data/ca")
-    from pathlib import Path as _Path
-    (_Path(ca_dir) / CRL_FILE).write_bytes(crl.public_bytes(serialization.Encoding.PEM))
-    request.app.state.fl_crl = crl
+        return False
+    try:
+        serials = _store(request).list_revoked_serials()
+        crl = build_crl(ca_priv, ca_cert, revoked_serials=serials)
+        ca_dir = _os.environ.get("FL_CA_DIR", "data/ca")
+        from pathlib import Path as _Path
+        (_Path(ca_dir) / CRL_FILE).write_bytes(crl.public_bytes(serialization.Encoding.PEM))
+        request.app.state.fl_crl = crl
+        return True
+    except Exception as e:
+        logger.warning("CRL regeneration failed; revoked org still blocked by "
+                       "status check", error=str(e))
+        return False
 
 
 # ── Org authentication (mTLS preferred; API key fallback for bootstrap/test) ─
@@ -467,11 +476,13 @@ async def approve_removal(
     coord_priv = getattr(request.app.state, "fl_coord_priv", None)
     if coord_priv is None:
         raise HTTPException(503, "Coordinator signing key not loaded")
-    store.set_org_status(org_id, "revoked")
-    _regenerate_crl(request)
+    # Sign + persist the removal confirmation FIRST so the org can always
+    # finalize, even if the best-effort CRL regen below fails.
     confirm_bytes = build_removal_confirm_attestation(org_id=org_id)
     sig_hex = att_sign(coord_priv, confirm_bytes).hex()
+    store.set_org_status(org_id, "revoked")
     store.set_removal_confirm(org_id, confirm_bytes, sig_hex)
+    _regenerate_crl(request)
     _audit(request).log(
         action="fl.org.removal_approved", actor=user.username, target=org_id, details={},
     )
