@@ -96,6 +96,34 @@ def _extract_cert_from_scope(request: Request) -> Optional[x509.Certificate]:
     return None
 
 
+def _extract_cert_from_proxy_header(request: Request) -> Optional[x509.Certificate]:
+    """When behind a TRUSTED mTLS-terminating proxy (nginx; FL_TRUSTED_PROXY=1),
+    the proxy verifies the client cert at the TLS layer and forwards it as a
+    URL-escaped PEM header (X-SSL-Client-Cert) plus X-SSL-Client-Verify=SUCCESS.
+    The cert is still re-verified below (CA + CRL + expiry + org-active), so the
+    proxy is trusted only to TERMINATE TLS, not to assert identity.
+
+    SECURITY: only honoured when FL_TRUSTED_PROXY=1. In that mode the coordinator
+    MUST be reachable ONLY through the proxy (internal network, port not
+    published) — the header carries a public cert PEM, so the real proof of
+    private-key possession is the proxy's TLS handshake. If the coordinator were
+    directly reachable, anyone holding an org's (non-secret) cert PEM could spoof
+    the header. The compose enforces this by not publishing the coordinator port."""
+    if os.environ.get("FL_TRUSTED_PROXY", "0") != "1":
+        return None
+    if request.headers.get("x-ssl-client-verify", "").upper() != "SUCCESS":
+        return None
+    pem = request.headers.get("x-ssl-client-cert", "")
+    if not pem:
+        return None
+    try:
+        from urllib.parse import unquote
+        return x509.load_pem_x509_certificate(unquote(pem).encode())
+    except Exception as e:
+        logger.warning("Could not parse proxy client-cert header", error=str(e))
+        return None
+
+
 class MTLSMiddleware(BaseHTTPMiddleware):
     """
     Sets request.state.mtls_org_id when a valid peer cert is present.
@@ -130,8 +158,8 @@ class MTLSMiddleware(BaseHTTPMiddleware):
                 )
                 return hdr
 
-        # ── Real TLS path ───────────────────────────────────────────────────
-        cert = _extract_cert_from_scope(request)
+        # ── Cert source: trusted mTLS proxy header (nginx), else direct-TLS scope ─
+        cert = _extract_cert_from_proxy_header(request) or _extract_cert_from_scope(request)
         if cert is None:
             return None
 

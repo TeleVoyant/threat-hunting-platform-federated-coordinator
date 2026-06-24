@@ -1,0 +1,36 @@
+# TEMPLATE — adding a new app behind the edge proxy.
+#
+# 1. Run your app on the external 'edge' network with a network alias, e.g. in
+#    its docker-compose.yml:
+#        services:
+#          myapp:
+#            # ...
+#            networks: [edge]
+#        networks:
+#          edge:
+#            external: true
+#    (The alias other containers resolve is the service name — here 'myapp'.)
+#
+# 2. Copy this file to conf.d/myapp.conf, edit the names, then reload:
+#        docker compose exec nginx nginx -t && docker compose exec nginx nginx -s reload
+#
+# 3. Point DNS (or use sslip.io): app2.13.140.173.164.sslip.io already resolves
+#    to the server IP, no DNS setup needed.
+
+# upstream myapp_backend { server myapp:8080; }
+#
+# server {
+#     listen 443 ssl;
+#     server_name app2.13.140.173.164.sslip.io;
+#
+#     # Self-signed default for now; swap for a per-app / Let's Encrypt cert later.
+#     ssl_certificate     /certs/default/default_cert.pem;
+#     ssl_certificate_key /certs/default/default_key.pem;
+#
+#     location / {
+#         proxy_pass http://myapp_backend;
+#         proxy_set_header Host              $host;
+#         proxy_set_header X-Forwarded-For   $remote_addr;
+#         proxy_set_header X-Forwarded-Proto https;
+#     }
+# }

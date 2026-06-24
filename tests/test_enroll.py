@@ -131,7 +131,38 @@ def test_token_store_expiry_and_single_use():
     print("PASS test_token_store_expiry_and_single_use")
 
 
+def test_proxy_mtls_header():
+    """FL_TRUSTED_PROXY: an mTLS-terminating proxy forwards the verified client
+    cert as X-SSL-Client-Cert; the middleware resolves the org from it (and still
+    re-verifies it). Unverified (X-SSL-Client-Verify != SUCCESS) must NOT auth."""
+    import urllib.parse
+    import os as _os
+    mint = _mint("orgproxy", "Org Proxy")
+    ed_priv, ed_pub_pem, x_priv, x_pub_pem = _org_keys()
+    ok = client.post("/fl/orgs/enroll-with-token",
+                     json=_body(mint["token"], "orgproxy", ed_priv, ed_pub_pem, x_pub_pem))
+    assert ok.status_code == 201, ok.text
+    from flproto.seal_box import x25519_private_to_pem, unseal
+    pkg = json.loads(unseal(x25519_private_to_pem(x_priv), ok.json()["sealed_package_b64"]))
+    cert_pem = pkg["client_cert_pem"]
+
+    _os.environ["FL_TRUSTED_PROXY"] = "1"
+    try:
+        r = client.get("/fl/rounds/active", headers={
+            "X-SSL-Client-Verify": "SUCCESS",
+            "X-SSL-Client-Cert": urllib.parse.quote(cert_pem)})
+        assert r.status_code == 200, ("proxy header must resolve org", r.status_code, r.text)
+        r2 = client.get("/fl/rounds/active", headers={
+            "X-SSL-Client-Verify": "NONE",
+            "X-SSL-Client-Cert": urllib.parse.quote(cert_pem)})
+        assert r2.status_code == 401, ("unverified proxy cert must not auth", r2.status_code)
+    finally:
+        _os.environ.pop("FL_TRUSTED_PROXY", None)
+    print("PASS test_proxy_mtls_header")
+
+
 if __name__ == "__main__":
     test_self_enroll()
     test_token_store_expiry_and_single_use()
+    test_proxy_mtls_header()
     print("ALL ENROLL TESTS PASSED")

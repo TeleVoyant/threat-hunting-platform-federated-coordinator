@@ -1,0 +1,41 @@
+# Coordinator overlay: run BEHIND the HOST nginx reverse proxy (see edge-proxy/).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mtls.yml up -d
+#
+# WHAT IT CHANGES
+#   - Coordinator drops its own TLS (uvicorn serves plain HTTP); HOST nginx
+#     terminates TLS + client-cert mTLS and forwards the verified cert.
+#   - Coordinator is published ONLY on 127.0.0.1:8890 (localhost) instead of
+#     0.0.0.0:8889 — so it is reachable ONLY by the host nginx, never directly
+#     from the internet.
+#   - FL_TRUSTED_PROXY=1 → coordinator/mtls_middleware reads the proxy's
+#     X-SSL-Client-Cert header (and still re-verifies it against the CA + CRL).
+#
+# WHY localhost-only: the header carries a PUBLIC cert PEM; the real proof of
+# private-key possession is nginx's TLS handshake. Binding the coordinator to
+# 127.0.0.1 means external clients cannot reach it to spoof the header.
+#
+# ROLLBACK: `docker compose -f docker-compose.yml up -d` (no overlay) → back to
+# direct uvicorn TLS on 0.0.0.0:8889 (and stop/bypass nginx).
+
+services:
+  coordinator:
+    # Publish localhost-only; HOST nginx fronts the public :8889. !override
+    # replaces the base ports list (needs Docker Compose >= 2.24; otherwise edit
+    # the base compose ports directly on the server).
+    ports: !override
+      - "127.0.0.1:8890:8889"
+    # Drop uvicorn TLS — nginx terminates it; serve plain HTTP in the container.
+    command: >
+      python -m uvicorn coordinator.app:app
+      --host 0.0.0.0 --port 8889
+    environment:
+      - FL_DATA_DIR=/app/data
+      - FL_REQUIRE_MTLS=1
+      - FL_TRUSTED_PROXY=1
+      - FL_CA_DIR=/app/data/ca
+      - FL_MODEL_DIR=/app/data/models
+      - FL_USERS_FILE=/app/config/fl_users.yml
+      - FL_JWT_SECRET_FILE=/run/secrets/fl_jwt_secret
+      - FL_VALIDATION_DATA=/app/config/validation.svm
+      - FL_MAX_MODEL_BYTES=67108864
